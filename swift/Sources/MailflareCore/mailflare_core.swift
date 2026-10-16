@@ -954,6 +954,34 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func cachedMessage(accountId: String, messageId: String) throws  -> MessageDetail?
     
     /**
+     * A prefilled composer for replying to or forwarding `message_id`.
+     */
+    func composeTemplate(accountId: String, messageId: String, kind: ReplyKind) async throws  -> ComposeTemplate
+    
+    /**
+     * Moves messages to Trash; messages already in Trash or Drafts are
+     * deleted permanently. Returns how many were deleted permanently.
+     */
+    func deleteMessages(accountId: String, messageIds: [String]) throws  -> UInt32
+    
+    /**
+     * Drops an outbox item that has not been sent. A partially stored draft
+     * on the server is left for the user to delete.
+     */
+    func discardOutboxItem(accountId: String, clientId: String) throws 
+    
+    /**
+     * Downloads an attachment into the core's cache and returns the file
+     * path. A cached file is returned without the network.
+     */
+    func downloadAttachment(accountId: String, attachment: Attachment) async throws  -> String
+    
+    /**
+     * A stored draft, reopened for editing. Saving or sending replaces it.
+     */
+    func draftTemplate(accountId: String, messageId: String) async throws  -> ComposeTemplate
+    
+    /**
      * Pages the next older batch of a folder from the server. Returns the
      * number of messages received; 0 means the folder is fully loaded.
      */
@@ -963,6 +991,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      * Retries queued actions, e.g. when connectivity returns.
      */
     func flushActions(accountId: String) 
+    
+    /**
+     * Addresses the account may send from.
+     */
+    func identities(accountId: String) throws  -> [Identity]
     
     /**
      * Fetches, sanitizes and caches the body.
@@ -983,12 +1016,42 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      */
     func messages(accountId: String, folder: Folder, offset: UInt32, limit: UInt32) throws  -> [MessageSummary]
     
+    /**
+     * Moves messages. A role target resolves per message to that role's
+     * mailbox for the same address; messages already there are skipped.
+     */
+    func moveMessages(accountId: String, messageIds: [String], target: MoveTarget) throws  -> UInt32
+    
+    func outbox(accountId: String) throws  -> [OutboxItem]
+    
     func pendingActionCount(accountId: String) throws  -> UInt32
+    
+    /**
+     * Retries a stalled outbox item now.
+     */
+    func retryOutboxItem(accountId: String, clientId: String) throws 
+    
+    /**
+     * Queues saving a draft to the server's Drafts.
+     */
+    func saveDraft(accountId: String, message: OutgoingMessage) throws  -> String
     
     /**
      * Local full-text search over sender, subject and preview.
      */
     func search(accountId: String, query: String, limit: UInt32) throws  -> [MessageSummary]
+    
+    /**
+     * Searches the server (mail outside the synced windows). Results are
+     * cached, so local search finds them afterwards.
+     */
+    func searchServer(accountId: String, query: String, limit: UInt32) async throws  -> [MessageSummary]
+    
+    /**
+     * Queues a message for sending and returns its outbox id. It is sent as
+     * soon as the server is reachable; failures stay in the outbox.
+     */
+    func send(accountId: String, message: OutgoingMessage) throws  -> String
     
     func setFlagged(accountId: String, messageIds: [String], flagged: Bool) throws 
     
@@ -1007,6 +1070,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      * Removes the account, its cached mail, queued actions and its secret.
      */
     func signOut(accountId: String) throws 
+    
+    /**
+     * Known correspondents matching `prefix`, for the recipient fields.
+     */
+    func suggestContacts(accountId: String, prefix: String, limit: UInt32) throws  -> [EmailAddress]
     
     func sync(accountId: String) async throws 
     
@@ -1100,6 +1168,92 @@ open func cachedMessage(accountId: String, messageId: String)throws  -> MessageD
 }
     
     /**
+     * A prefilled composer for replying to or forwarding `message_id`.
+     */
+open func composeTemplate(accountId: String, messageId: String, kind: ReplyKind)async throws  -> ComposeTemplate  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_compose_template(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterString.lower(messageId),FfiConverterTypeReplyKind_lower(kind)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposeTemplate_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Moves messages to Trash; messages already in Trash or Drafts are
+     * deleted permanently. Returns how many were deleted permanently.
+     */
+open func deleteMessages(accountId: String, messageIds: [String])throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_delete_messages(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterSequenceString.lower(messageIds),$0
+    )
+})
+}
+    
+    /**
+     * Drops an outbox item that has not been sent. A partially stored draft
+     * on the server is left for the user to delete.
+     */
+open func discardOutboxItem(accountId: String, clientId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_discard_outbox_item(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(clientId),$0
+    )
+}
+}
+    
+    /**
+     * Downloads an attachment into the core's cache and returns the file
+     * path. A cached file is returned without the network.
+     */
+open func downloadAttachment(accountId: String, attachment: Attachment)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_download_attachment(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterTypeAttachment_lower(attachment)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * A stored draft, reopened for editing. Saving or sending replaces it.
+     */
+open func draftTemplate(accountId: String, messageId: String)async throws  -> ComposeTemplate  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_draft_template(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterString.lower(messageId)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposeTemplate_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Pages the next older batch of a folder from the server. Returns the
      * number of messages received; 0 means the folder is fully loaded.
      */
@@ -1128,6 +1282,17 @@ open func flushActions(accountId: String)  {try! rustCall() {
         FfiConverterString.lower(accountId),$0
     )
 }
+}
+    
+    /**
+     * Addresses the account may send from.
+     */
+open func identities(accountId: String)throws  -> [Identity]  {
+    return try  FfiConverterSequenceTypeIdentity.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_identities(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),$0
+    )
+})
 }
     
     /**
@@ -1193,10 +1358,55 @@ open func messages(accountId: String, folder: Folder, offset: UInt32, limit: UIn
 })
 }
     
+    /**
+     * Moves messages. A role target resolves per message to that role's
+     * mailbox for the same address; messages already there are skipped.
+     */
+open func moveMessages(accountId: String, messageIds: [String], target: MoveTarget)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_move_messages(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterSequenceString.lower(messageIds),
+        FfiConverterTypeMoveTarget_lower(target),$0
+    )
+})
+}
+    
+open func outbox(accountId: String)throws  -> [OutboxItem]  {
+    return try  FfiConverterSequenceTypeOutboxItem.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_outbox(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),$0
+    )
+})
+}
+    
 open func pendingActionCount(accountId: String)throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_mailflare_core_fn_method_mailcore_pending_action_count(self.uniffiClonePointer(),
         FfiConverterString.lower(accountId),$0
+    )
+})
+}
+    
+    /**
+     * Retries a stalled outbox item now.
+     */
+open func retryOutboxItem(accountId: String, clientId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_retry_outbox_item(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(clientId),$0
+    )
+}
+}
+    
+    /**
+     * Queues saving a draft to the server's Drafts.
+     */
+open func saveDraft(accountId: String, message: OutgoingMessage)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_save_draft(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeOutgoingMessage_lower(message),$0
     )
 })
 }
@@ -1210,6 +1420,40 @@ open func search(accountId: String, query: String, limit: UInt32)throws  -> [Mes
         FfiConverterString.lower(accountId),
         FfiConverterString.lower(query),
         FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * Searches the server (mail outside the synced windows). Results are
+     * cached, so local search finds them afterwards.
+     */
+open func searchServer(accountId: String, query: String, limit: UInt32)async throws  -> [MessageSummary]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_search_server(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterString.lower(query),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeMessageSummary.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Queues a message for sending and returns its outbox id. It is sent as
+     * soon as the server is reachable; failures stay in the outbox.
+     */
+open func send(accountId: String, message: OutgoingMessage)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_send(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterTypeOutgoingMessage_lower(message),$0
     )
 })
 }
@@ -1269,6 +1513,19 @@ open func signOut(accountId: String)throws   {try rustCallWithError(FfiConverter
         FfiConverterString.lower(accountId),$0
     )
 }
+}
+    
+    /**
+     * Known correspondents matching `prefix`, for the recipient fields.
+     */
+open func suggestContacts(accountId: String, prefix: String, limit: UInt32)throws  -> [EmailAddress]  {
+    return try  FfiConverterSequenceTypeEmailAddress.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_suggest_contacts(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(prefix),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
 }
     
 open func sync(accountId: String)async throws   {
@@ -1528,6 +1785,163 @@ public func FfiConverterTypeAttachment_lower(_ value: Attachment) -> RustBuffer 
 }
 
 
+/**
+ * A prefilled composer for a reply, reply-all, forward or opened draft.
+ */
+public struct ComposeTemplate {
+    public var identityId: String?
+    public var to: [EmailAddress]
+    public var cc: [EmailAddress]
+    public var bcc: [EmailAddress]
+    public var subject: String
+    /**
+     * The editable part of the body (empty for replies and forwards).
+     */
+    public var bodyHtml: String
+    /**
+     * Quoted original, appended below the editable body when sending.
+     */
+    public var quotedHtml: String
+    public var inReplyTo: String?
+    public var references: [String]
+    public var attachments: [OutgoingAttachment]
+    public var replacesDraftId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identityId: String?, to: [EmailAddress], cc: [EmailAddress], bcc: [EmailAddress], subject: String, 
+        /**
+         * The editable part of the body (empty for replies and forwards).
+         */bodyHtml: String, 
+        /**
+         * Quoted original, appended below the editable body when sending.
+         */quotedHtml: String, inReplyTo: String?, references: [String], attachments: [OutgoingAttachment], replacesDraftId: String?) {
+        self.identityId = identityId
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.bodyHtml = bodyHtml
+        self.quotedHtml = quotedHtml
+        self.inReplyTo = inReplyTo
+        self.references = references
+        self.attachments = attachments
+        self.replacesDraftId = replacesDraftId
+    }
+}
+
+#if compiler(>=6)
+extension ComposeTemplate: Sendable {}
+#endif
+
+
+extension ComposeTemplate: Equatable, Hashable {
+    public static func ==(lhs: ComposeTemplate, rhs: ComposeTemplate) -> Bool {
+        if lhs.identityId != rhs.identityId {
+            return false
+        }
+        if lhs.to != rhs.to {
+            return false
+        }
+        if lhs.cc != rhs.cc {
+            return false
+        }
+        if lhs.bcc != rhs.bcc {
+            return false
+        }
+        if lhs.subject != rhs.subject {
+            return false
+        }
+        if lhs.bodyHtml != rhs.bodyHtml {
+            return false
+        }
+        if lhs.quotedHtml != rhs.quotedHtml {
+            return false
+        }
+        if lhs.inReplyTo != rhs.inReplyTo {
+            return false
+        }
+        if lhs.references != rhs.references {
+            return false
+        }
+        if lhs.attachments != rhs.attachments {
+            return false
+        }
+        if lhs.replacesDraftId != rhs.replacesDraftId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identityId)
+        hasher.combine(to)
+        hasher.combine(cc)
+        hasher.combine(bcc)
+        hasher.combine(subject)
+        hasher.combine(bodyHtml)
+        hasher.combine(quotedHtml)
+        hasher.combine(inReplyTo)
+        hasher.combine(references)
+        hasher.combine(attachments)
+        hasher.combine(replacesDraftId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposeTemplate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposeTemplate {
+        return
+            try ComposeTemplate(
+                identityId: FfiConverterOptionString.read(from: &buf), 
+                to: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                cc: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                bcc: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                subject: FfiConverterString.read(from: &buf), 
+                bodyHtml: FfiConverterString.read(from: &buf), 
+                quotedHtml: FfiConverterString.read(from: &buf), 
+                inReplyTo: FfiConverterOptionString.read(from: &buf), 
+                references: FfiConverterSequenceString.read(from: &buf), 
+                attachments: FfiConverterSequenceTypeOutgoingAttachment.read(from: &buf), 
+                replacesDraftId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ComposeTemplate, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.identityId, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.to, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.cc, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.bcc, into: &buf)
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterString.write(value.bodyHtml, into: &buf)
+        FfiConverterString.write(value.quotedHtml, into: &buf)
+        FfiConverterOptionString.write(value.inReplyTo, into: &buf)
+        FfiConverterSequenceString.write(value.references, into: &buf)
+        FfiConverterSequenceTypeOutgoingAttachment.write(value.attachments, into: &buf)
+        FfiConverterOptionString.write(value.replacesDraftId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposeTemplate_lift(_ buf: RustBuffer) throws -> ComposeTemplate {
+    return try FfiConverterTypeComposeTemplate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposeTemplate_lower(_ value: ComposeTemplate) -> RustBuffer {
+    return FfiConverterTypeComposeTemplate.lower(value)
+}
+
+
 public struct EmailAddress {
     public var name: String?
     public var email: String
@@ -1595,6 +2009,87 @@ public func FfiConverterTypeEmailAddress_lift(_ buf: RustBuffer) throws -> Email
 #endif
 public func FfiConverterTypeEmailAddress_lower(_ value: EmailAddress) -> RustBuffer {
     return FfiConverterTypeEmailAddress.lower(value)
+}
+
+
+/**
+ * An address the account may send from.
+ */
+public struct Identity {
+    public var id: String
+    public var name: String
+    public var email: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, email: String) {
+        self.id = id
+        self.name = name
+        self.email = email
+    }
+}
+
+#if compiler(>=6)
+extension Identity: Sendable {}
+#endif
+
+
+extension Identity: Equatable, Hashable {
+    public static func ==(lhs: Identity, rhs: Identity) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.email != rhs.email {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(email)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIdentity: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Identity {
+        return
+            try Identity(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                email: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Identity, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.email, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentity_lift(_ buf: RustBuffer) throws -> Identity {
+    return try FfiConverterTypeIdentity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentity_lower(_ value: Identity) -> RustBuffer {
+    return FfiConverterTypeIdentity.lower(value)
 }
 
 
@@ -1734,6 +2229,11 @@ public struct MessageDetail {
     public var html: String
     public var hasRemoteContent: Bool
     public var attachments: [Attachment]
+    /**
+     * Message-ID without angle brackets, for replies.
+     */
+    public var messageId: String?
+    public var references: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1741,7 +2241,10 @@ public struct MessageDetail {
         /**
          * Sanitized HTML: no scripts, handlers or forms. Remote URLs are kept but
          * must be blocked by the renderer unless the user allows them.
-         */html: String, hasRemoteContent: Bool, attachments: [Attachment]) {
+         */html: String, hasRemoteContent: Bool, attachments: [Attachment], 
+        /**
+         * Message-ID without angle brackets, for replies.
+         */messageId: String?, references: [String]) {
         self.summary = summary
         self.to = to
         self.cc = cc
@@ -1749,6 +2252,8 @@ public struct MessageDetail {
         self.html = html
         self.hasRemoteContent = hasRemoteContent
         self.attachments = attachments
+        self.messageId = messageId
+        self.references = references
     }
 }
 
@@ -1780,6 +2285,12 @@ extension MessageDetail: Equatable, Hashable {
         if lhs.attachments != rhs.attachments {
             return false
         }
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        if lhs.references != rhs.references {
+            return false
+        }
         return true
     }
 
@@ -1791,6 +2302,8 @@ extension MessageDetail: Equatable, Hashable {
         hasher.combine(html)
         hasher.combine(hasRemoteContent)
         hasher.combine(attachments)
+        hasher.combine(messageId)
+        hasher.combine(references)
     }
 }
 
@@ -1809,7 +2322,9 @@ public struct FfiConverterTypeMessageDetail: FfiConverterRustBuffer {
                 replyTo: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
                 html: FfiConverterString.read(from: &buf), 
                 hasRemoteContent: FfiConverterBool.read(from: &buf), 
-                attachments: FfiConverterSequenceTypeAttachment.read(from: &buf)
+                attachments: FfiConverterSequenceTypeAttachment.read(from: &buf), 
+                messageId: FfiConverterOptionString.read(from: &buf), 
+                references: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -1821,6 +2336,8 @@ public struct FfiConverterTypeMessageDetail: FfiConverterRustBuffer {
         FfiConverterString.write(value.html, into: &buf)
         FfiConverterBool.write(value.hasRemoteContent, into: &buf)
         FfiConverterSequenceTypeAttachment.write(value.attachments, into: &buf)
+        FfiConverterOptionString.write(value.messageId, into: &buf)
+        FfiConverterSequenceString.write(value.references, into: &buf)
     }
 }
 
@@ -1846,6 +2363,10 @@ public struct MessageSummary {
     public var mailboxId: String
     public var fromName: String
     public var fromEmail: String
+    /**
+     * Recipients for display ("Maya Chen, bob"), shown in Sent and Drafts.
+     */
+    public var toDisplay: String
     public var subject: String
     public var preview: String
     /**
@@ -1858,7 +2379,10 @@ public struct MessageSummary {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, threadId: String, mailboxId: String, fromName: String, fromEmail: String, subject: String, preview: String, 
+    public init(id: String, threadId: String, mailboxId: String, fromName: String, fromEmail: String, 
+        /**
+         * Recipients for display ("Maya Chen, bob"), shown in Sent and Drafts.
+         */toDisplay: String, subject: String, preview: String, 
         /**
          * Unix seconds.
          */receivedAt: Int64, seen: Bool, flagged: Bool, hasAttachment: Bool) {
@@ -1867,6 +2391,7 @@ public struct MessageSummary {
         self.mailboxId = mailboxId
         self.fromName = fromName
         self.fromEmail = fromEmail
+        self.toDisplay = toDisplay
         self.subject = subject
         self.preview = preview
         self.receivedAt = receivedAt
@@ -1898,6 +2423,9 @@ extension MessageSummary: Equatable, Hashable {
         if lhs.fromEmail != rhs.fromEmail {
             return false
         }
+        if lhs.toDisplay != rhs.toDisplay {
+            return false
+        }
         if lhs.subject != rhs.subject {
             return false
         }
@@ -1925,6 +2453,7 @@ extension MessageSummary: Equatable, Hashable {
         hasher.combine(mailboxId)
         hasher.combine(fromName)
         hasher.combine(fromEmail)
+        hasher.combine(toDisplay)
         hasher.combine(subject)
         hasher.combine(preview)
         hasher.combine(receivedAt)
@@ -1948,6 +2477,7 @@ public struct FfiConverterTypeMessageSummary: FfiConverterRustBuffer {
                 mailboxId: FfiConverterString.read(from: &buf), 
                 fromName: FfiConverterString.read(from: &buf), 
                 fromEmail: FfiConverterString.read(from: &buf), 
+                toDisplay: FfiConverterString.read(from: &buf), 
                 subject: FfiConverterString.read(from: &buf), 
                 preview: FfiConverterString.read(from: &buf), 
                 receivedAt: FfiConverterInt64.read(from: &buf), 
@@ -1963,6 +2493,7 @@ public struct FfiConverterTypeMessageSummary: FfiConverterRustBuffer {
         FfiConverterString.write(value.mailboxId, into: &buf)
         FfiConverterString.write(value.fromName, into: &buf)
         FfiConverterString.write(value.fromEmail, into: &buf)
+        FfiConverterString.write(value.toDisplay, into: &buf)
         FfiConverterString.write(value.subject, into: &buf)
         FfiConverterString.write(value.preview, into: &buf)
         FfiConverterInt64.write(value.receivedAt, into: &buf)
@@ -1985,6 +2516,370 @@ public func FfiConverterTypeMessageSummary_lift(_ buf: RustBuffer) throws -> Mes
 #endif
 public func FfiConverterTypeMessageSummary_lower(_ value: MessageSummary) -> RustBuffer {
     return FfiConverterTypeMessageSummary.lower(value)
+}
+
+
+/**
+ * A queued send or draft save, for the Outbox view.
+ */
+public struct OutboxItem {
+    public var clientId: String
+    public var kind: OutboxKind
+    public var subject: String
+    public var recipients: String
+    public var attempts: UInt32
+    public var error: String?
+    /**
+     * True once automatic retries stopped; the user can retry or discard it.
+     */
+    public var stalled: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientId: String, kind: OutboxKind, subject: String, recipients: String, attempts: UInt32, error: String?, 
+        /**
+         * True once automatic retries stopped; the user can retry or discard it.
+         */stalled: Bool) {
+        self.clientId = clientId
+        self.kind = kind
+        self.subject = subject
+        self.recipients = recipients
+        self.attempts = attempts
+        self.error = error
+        self.stalled = stalled
+    }
+}
+
+#if compiler(>=6)
+extension OutboxItem: Sendable {}
+#endif
+
+
+extension OutboxItem: Equatable, Hashable {
+    public static func ==(lhs: OutboxItem, rhs: OutboxItem) -> Bool {
+        if lhs.clientId != rhs.clientId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.subject != rhs.subject {
+            return false
+        }
+        if lhs.recipients != rhs.recipients {
+            return false
+        }
+        if lhs.attempts != rhs.attempts {
+            return false
+        }
+        if lhs.error != rhs.error {
+            return false
+        }
+        if lhs.stalled != rhs.stalled {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(clientId)
+        hasher.combine(kind)
+        hasher.combine(subject)
+        hasher.combine(recipients)
+        hasher.combine(attempts)
+        hasher.combine(error)
+        hasher.combine(stalled)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutboxItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboxItem {
+        return
+            try OutboxItem(
+                clientId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeOutboxKind.read(from: &buf), 
+                subject: FfiConverterString.read(from: &buf), 
+                recipients: FfiConverterString.read(from: &buf), 
+                attempts: FfiConverterUInt32.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                stalled: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutboxItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.clientId, into: &buf)
+        FfiConverterTypeOutboxKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterString.write(value.recipients, into: &buf)
+        FfiConverterUInt32.write(value.attempts, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterBool.write(value.stalled, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboxItem_lift(_ buf: RustBuffer) throws -> OutboxItem {
+    return try FfiConverterTypeOutboxItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboxItem_lower(_ value: OutboxItem) -> RustBuffer {
+    return FfiConverterTypeOutboxItem.lower(value)
+}
+
+
+/**
+ * An attachment of an outgoing message: a local file the app hands over
+ * (copied into the core's outbox, so the original may be deleted), or a
+ * server blob to carry over when forwarding.
+ */
+public struct OutgoingAttachment {
+    public var filePath: String?
+    public var blobId: String?
+    public var name: String
+    public var mimeType: String
+    public var size: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filePath: String?, blobId: String?, name: String, mimeType: String, size: UInt64) {
+        self.filePath = filePath
+        self.blobId = blobId
+        self.name = name
+        self.mimeType = mimeType
+        self.size = size
+    }
+}
+
+#if compiler(>=6)
+extension OutgoingAttachment: Sendable {}
+#endif
+
+
+extension OutgoingAttachment: Equatable, Hashable {
+    public static func ==(lhs: OutgoingAttachment, rhs: OutgoingAttachment) -> Bool {
+        if lhs.filePath != rhs.filePath {
+            return false
+        }
+        if lhs.blobId != rhs.blobId {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.mimeType != rhs.mimeType {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(filePath)
+        hasher.combine(blobId)
+        hasher.combine(name)
+        hasher.combine(mimeType)
+        hasher.combine(size)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutgoingAttachment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingAttachment {
+        return
+            try OutgoingAttachment(
+                filePath: FfiConverterOptionString.read(from: &buf), 
+                blobId: FfiConverterOptionString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutgoingAttachment, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.filePath, into: &buf)
+        FfiConverterOptionString.write(value.blobId, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingAttachment_lift(_ buf: RustBuffer) throws -> OutgoingAttachment {
+    return try FfiConverterTypeOutgoingAttachment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingAttachment_lower(_ value: OutgoingAttachment) -> RustBuffer {
+    return FfiConverterTypeOutgoingAttachment.lower(value)
+}
+
+
+public struct OutgoingMessage {
+    public var identityId: String
+    public var to: [EmailAddress]
+    public var cc: [EmailAddress]
+    public var bcc: [EmailAddress]
+    public var subject: String
+    /**
+     * The body as HTML; the plain-text part is derived from it.
+     */
+    public var html: String
+    public var inReplyTo: String?
+    public var references: [String]
+    public var attachments: [OutgoingAttachment]
+    /**
+     * A server draft this message replaces; it is deleted once this one is stored.
+     */
+    public var replacesDraftId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identityId: String, to: [EmailAddress], cc: [EmailAddress], bcc: [EmailAddress], subject: String, 
+        /**
+         * The body as HTML; the plain-text part is derived from it.
+         */html: String, inReplyTo: String?, references: [String], attachments: [OutgoingAttachment], 
+        /**
+         * A server draft this message replaces; it is deleted once this one is stored.
+         */replacesDraftId: String?) {
+        self.identityId = identityId
+        self.to = to
+        self.cc = cc
+        self.bcc = bcc
+        self.subject = subject
+        self.html = html
+        self.inReplyTo = inReplyTo
+        self.references = references
+        self.attachments = attachments
+        self.replacesDraftId = replacesDraftId
+    }
+}
+
+#if compiler(>=6)
+extension OutgoingMessage: Sendable {}
+#endif
+
+
+extension OutgoingMessage: Equatable, Hashable {
+    public static func ==(lhs: OutgoingMessage, rhs: OutgoingMessage) -> Bool {
+        if lhs.identityId != rhs.identityId {
+            return false
+        }
+        if lhs.to != rhs.to {
+            return false
+        }
+        if lhs.cc != rhs.cc {
+            return false
+        }
+        if lhs.bcc != rhs.bcc {
+            return false
+        }
+        if lhs.subject != rhs.subject {
+            return false
+        }
+        if lhs.html != rhs.html {
+            return false
+        }
+        if lhs.inReplyTo != rhs.inReplyTo {
+            return false
+        }
+        if lhs.references != rhs.references {
+            return false
+        }
+        if lhs.attachments != rhs.attachments {
+            return false
+        }
+        if lhs.replacesDraftId != rhs.replacesDraftId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identityId)
+        hasher.combine(to)
+        hasher.combine(cc)
+        hasher.combine(bcc)
+        hasher.combine(subject)
+        hasher.combine(html)
+        hasher.combine(inReplyTo)
+        hasher.combine(references)
+        hasher.combine(attachments)
+        hasher.combine(replacesDraftId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutgoingMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingMessage {
+        return
+            try OutgoingMessage(
+                identityId: FfiConverterString.read(from: &buf), 
+                to: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                cc: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                bcc: FfiConverterSequenceTypeEmailAddress.read(from: &buf), 
+                subject: FfiConverterString.read(from: &buf), 
+                html: FfiConverterString.read(from: &buf), 
+                inReplyTo: FfiConverterOptionString.read(from: &buf), 
+                references: FfiConverterSequenceString.read(from: &buf), 
+                attachments: FfiConverterSequenceTypeOutgoingAttachment.read(from: &buf), 
+                replacesDraftId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutgoingMessage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.identityId, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.to, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.cc, into: &buf)
+        FfiConverterSequenceTypeEmailAddress.write(value.bcc, into: &buf)
+        FfiConverterString.write(value.subject, into: &buf)
+        FfiConverterString.write(value.html, into: &buf)
+        FfiConverterOptionString.write(value.inReplyTo, into: &buf)
+        FfiConverterSequenceString.write(value.references, into: &buf)
+        FfiConverterSequenceTypeOutgoingAttachment.write(value.attachments, into: &buf)
+        FfiConverterOptionString.write(value.replacesDraftId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingMessage_lift(_ buf: RustBuffer) throws -> OutgoingMessage {
+    return try FfiConverterTypeOutgoingMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingMessage_lower(_ value: OutgoingMessage) -> RustBuffer {
+    return FfiConverterTypeOutgoingMessage.lower(value)
 }
 
 
@@ -2149,6 +3044,13 @@ public enum CoreEvent {
     
     case mailboxesChanged(accountId: String
     )
+    case outboxChanged(accountId: String
+    )
+    /**
+     * A queued send reached the server.
+     */
+    case messageSent(accountId: String, subject: String
+    )
     case messagesChanged(accountId: String
     )
     case syncStarted(accountId: String
@@ -2175,13 +3077,19 @@ public struct FfiConverterTypeCoreEvent: FfiConverterRustBuffer {
         case 1: return .mailboxesChanged(accountId: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .messagesChanged(accountId: try FfiConverterString.read(from: &buf)
+        case 2: return .outboxChanged(accountId: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .syncStarted(accountId: try FfiConverterString.read(from: &buf)
+        case 3: return .messageSent(accountId: try FfiConverterString.read(from: &buf), subject: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .syncFinished(accountId: try FfiConverterString.read(from: &buf), error: try FfiConverterOptionString.read(from: &buf)
+        case 4: return .messagesChanged(accountId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .syncStarted(accountId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .syncFinished(accountId: try FfiConverterString.read(from: &buf), error: try FfiConverterOptionString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2197,18 +3105,29 @@ public struct FfiConverterTypeCoreEvent: FfiConverterRustBuffer {
             FfiConverterString.write(accountId, into: &buf)
             
         
-        case let .messagesChanged(accountId):
+        case let .outboxChanged(accountId):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(accountId, into: &buf)
             
         
-        case let .syncStarted(accountId):
+        case let .messageSent(accountId,subject):
             writeInt(&buf, Int32(3))
+            FfiConverterString.write(accountId, into: &buf)
+            FfiConverterString.write(subject, into: &buf)
+            
+        
+        case let .messagesChanged(accountId):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(accountId, into: &buf)
+            
+        
+        case let .syncStarted(accountId):
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(accountId, into: &buf)
             
         
         case let .syncFinished(accountId,error):
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(accountId, into: &buf)
             FfiConverterOptionString.write(error, into: &buf)
             
@@ -2320,6 +3239,232 @@ public func FfiConverterTypeFolder_lower(_ value: Folder) -> RustBuffer {
 
 
 extension Folder: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MoveTarget {
+    
+    /**
+     * The mailbox with this role next to each message's current one.
+     */
+    case role(role: String
+    )
+    case mailbox(id: String
+    )
+}
+
+
+#if compiler(>=6)
+extension MoveTarget: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMoveTarget: FfiConverterRustBuffer {
+    typealias SwiftType = MoveTarget
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MoveTarget {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .role(role: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .mailbox(id: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MoveTarget, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .role(role):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(role, into: &buf)
+            
+        
+        case let .mailbox(id):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(id, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMoveTarget_lift(_ buf: RustBuffer) throws -> MoveTarget {
+    return try FfiConverterTypeMoveTarget.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMoveTarget_lower(_ value: MoveTarget) -> RustBuffer {
+    return FfiConverterTypeMoveTarget.lower(value)
+}
+
+
+extension MoveTarget: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum OutboxKind {
+    
+    case send
+    case draft
+}
+
+
+#if compiler(>=6)
+extension OutboxKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutboxKind: FfiConverterRustBuffer {
+    typealias SwiftType = OutboxKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboxKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .send
+        
+        case 2: return .draft
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutboxKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .send:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .draft:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboxKind_lift(_ buf: RustBuffer) throws -> OutboxKind {
+    return try FfiConverterTypeOutboxKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboxKind_lower(_ value: OutboxKind) -> RustBuffer {
+    return FfiConverterTypeOutboxKind.lower(value)
+}
+
+
+extension OutboxKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ReplyKind {
+    
+    case reply
+    case replyAll
+    case forward
+}
+
+
+#if compiler(>=6)
+extension ReplyKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReplyKind: FfiConverterRustBuffer {
+    typealias SwiftType = ReplyKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReplyKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .reply
+        
+        case 2: return .replyAll
+        
+        case 3: return .forward
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ReplyKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .reply:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .replyAll:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .forward:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReplyKind_lift(_ buf: RustBuffer) throws -> ReplyKind {
+    return try FfiConverterTypeReplyKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReplyKind_lower(_ value: ReplyKind) -> RustBuffer {
+    return FfiConverterTypeReplyKind.lower(value)
+}
+
+
+extension ReplyKind: Equatable, Hashable {}
 
 
 
@@ -2525,6 +3670,31 @@ fileprivate struct FfiConverterSequenceTypeEmailAddress: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeIdentity: FfiConverterRustBuffer {
+    typealias SwiftType = [Identity]
+
+    public static func write(_ value: [Identity], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIdentity.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Identity] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Identity]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIdentity.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeMailbox: FfiConverterRustBuffer {
     typealias SwiftType = [Mailbox]
 
@@ -2567,6 +3737,56 @@ fileprivate struct FfiConverterSequenceTypeMessageSummary: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeMessageSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeOutboxItem: FfiConverterRustBuffer {
+    typealias SwiftType = [OutboxItem]
+
+    public static func write(_ value: [OutboxItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOutboxItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OutboxItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OutboxItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOutboxItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeOutgoingAttachment: FfiConverterRustBuffer {
+    typealias SwiftType = [OutgoingAttachment]
+
+    public static func write(_ value: [OutgoingAttachment], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOutgoingAttachment.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OutgoingAttachment] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OutgoingAttachment]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOutgoingAttachment.read(from: &buf))
         }
         return seq
     }
@@ -2617,6 +3837,16 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+/**
+ * Plain text for an HTML body (used to edit a stored draft as text).
+ */
+public func htmlToPlainText(html: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_mailflare_core_fn_func_html_to_plain_text(
+        FfiConverterString.lower(html),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -2632,6 +3862,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_mailflare_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_mailflare_core_checksum_func_html_to_plain_text() != 15321) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_corelistener_on_event() != 56193) {
         return InitializationResult.apiChecksumMismatch
@@ -2651,10 +3884,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_cached_message() != 29470) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_compose_template() != 12291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_delete_messages() != 20392) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_discard_outbox_item() != 43033) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_download_attachment() != 38929) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_draft_template() != 26548) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_fetch_older() != 41142) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_flush_actions() != 32230) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_identities() != 24587) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_load_message() != 53793) {
@@ -2672,10 +3923,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_messages() != 62969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_move_messages() != 38811) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_outbox() != 27933) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_pending_action_count() != 40755) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_retry_outbox_item() != 57888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_save_draft() != 54860) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_search() != 3079) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_search_server() != 21183) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_send() != 59722) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_set_flagged() != 20483) {
@@ -2691,6 +3960,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_sign_out() != 2207) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_suggest_contacts() != 46853) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_sync() != 37260) {

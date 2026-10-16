@@ -2,6 +2,8 @@
 //! native UIs read through the paged queries on [`MailCore`] and subscribe to
 //! [`CoreEvent`]s.
 
+mod actions;
+mod compose;
 mod error;
 mod jmap;
 mod sanitize;
@@ -23,6 +25,12 @@ use store::Store;
 
 uniffi::setup_scaffolding!();
 
+/// Plain text for an HTML body (used to edit a stored draft as text).
+#[uniffi::export]
+pub fn html_to_plain_text(html: String) -> String {
+	compose::html_to_text(&html)
+}
+
 /// Secrets live in the platform keychain, never in the database. The app
 /// implements this over Keychain Services (iOS) or the Keystore (Android).
 #[uniffi::export(with_foreign)]
@@ -38,6 +46,7 @@ pub trait CoreListener: Send + Sync {
 }
 
 struct Inner {
+	data_dir: PathBuf,
 	store: Store,
 	http: reqwest::Client,
 	credentials: Arc<dyn CredentialStore>,
@@ -65,6 +74,7 @@ impl Inner {
 			.load(account_id.to_string())
 			.ok_or_else(|| CoreError::Auth { message: "Sign in again to continue.".into() })?;
 		Ok(sync::Context {
+			account_id: account_id.to_string(),
 			store: &self.store,
 			http: &self.http,
 			credentials: Credentials { username: endpoint.email.clone(), secret },
@@ -79,7 +89,9 @@ impl Inner {
 		self.emit(CoreEvent::SyncStarted { account_id: account_id.to_string() });
 		let result = async {
 			// Push local changes first so the window re-query sees them.
-			let _ = sync::flush_actions(&ctx, account_id).await;
+			if let Ok(report) = actions::flush(&ctx, account_id, &self.data_dir).await {
+				self.report(account_id, &report);
+			}
 			let mailboxes = sync::sync_mailboxes(&ctx, account_id).await?;
 			self.emit(CoreEvent::MailboxesChanged { account_id: account_id.to_string() });
 			sync::sync_messages(&ctx, account_id, &mailboxes).await?;
@@ -94,11 +106,22 @@ impl Inner {
 		result
 	}
 
-	async fn flush(&self, account_id: &str) -> Result<u32> {
+	async fn flush(&self, account_id: &str) -> Result<actions::FlushReport> {
 		let lock = self.lock_for(account_id);
 		let _guard = lock.lock().await;
 		let ctx = self.context(account_id)?;
-		sync::flush_actions(&ctx, account_id).await
+		let report = actions::flush(&ctx, account_id, &self.data_dir).await?;
+		self.report(account_id, &report);
+		Ok(report)
+	}
+
+	fn report(&self, account_id: &str, report: &actions::FlushReport) {
+		for subject in &report.sent {
+			self.emit(CoreEvent::MessageSent { account_id: account_id.to_string(), subject: subject.clone() });
+		}
+		if report.outbox_changed {
+			self.emit(CoreEvent::OutboxChanged { account_id: account_id.to_string() });
+		}
 	}
 }
 
@@ -120,10 +143,16 @@ impl MailCore {
 		self.runtime.spawn(future).await.map_err(|e| CoreError::server(format!("Task failed: {e}")))?
 	}
 
+	/// Replays the queue in the background; a send or draft save is followed
+	/// by a sync so Sent and Drafts show the server's copy.
 	fn schedule_flush(&self, account_id: String) {
 		let inner = self.inner.clone();
 		self.runtime.spawn(async move {
-			let _ = inner.flush(&account_id).await;
+			if let Ok(report) = inner.flush(&account_id).await {
+				if report.needs_sync {
+					let _ = inner.sync(&account_id).await;
+				}
+			}
 		});
 	}
 }
@@ -151,6 +180,7 @@ impl MailCore {
 			.map_err(|e| CoreError::Storage { message: e.to_string() })?;
 		Ok(Arc::new(Self {
 			inner: Arc::new(Inner {
+				data_dir: dir,
 				store,
 				http,
 				credentials,
@@ -213,6 +243,7 @@ impl MailCore {
 				session_url: &session.session_url,
 				api_url: &session.api_url,
 				download_url: &session.download_url,
+				upload_url: &session.upload_url,
 				jmap_account_id: &session.account_id,
 			})?;
 			Ok(Account { id, email, display_name, server_url: server })
@@ -222,6 +253,10 @@ impl MailCore {
 
 	/// Removes the account, its cached mail, queued actions and its secret.
 	pub fn sign_out(&self, account_id: String) -> Result<()> {
+		for action in self.inner.store.pending_actions(&account_id)? {
+			let _ = std::fs::remove_dir_all(actions::outbox_dir(&self.inner.data_dir, &action.client_id));
+		}
+		let _ = std::fs::remove_dir_all(self.inner.data_dir.join("attachments").join(&account_id));
 		self.inner.store.delete_account(&account_id)?;
 		self.inner.credentials.delete(account_id);
 		Ok(())
@@ -310,7 +345,7 @@ impl MailCore {
 impl MailCore {
 	fn set_keyword(&self, account_id: String, message_ids: Vec<String>, keyword: &str, value: bool) -> Result<()> {
 		let client_id = uuid::Uuid::new_v4().to_string();
-		let payload = serde_json::to_string(&sync::KeywordAction { ids: message_ids.clone(), keyword: keyword.into(), value })?;
+		let payload = serde_json::to_string(&actions::KeywordAction { ids: message_ids.clone(), keyword: keyword.into(), value })?;
 		let changed = self.inner.store.apply_keyword(&account_id, &message_ids, keyword, value, &client_id, &payload)?;
 		if !changed.is_empty() {
 			self.inner.emit(CoreEvent::MessagesChanged { account_id: account_id.clone() });
@@ -320,5 +355,201 @@ impl MailCore {
 			self.schedule_flush(account_id);
 		}
 		Ok(())
+	}
+
+	fn enqueue_outgoing(&self, account_id: String, mut message: OutgoingMessage, send: bool) -> Result<String> {
+		if send && message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
+			return Err(CoreError::invalid("Add at least one recipient"));
+		}
+		if !self.inner.store.identities(&account_id)?.iter().any(|i| i.id == message.identity_id) {
+			return Err(CoreError::invalid("Choose an address to send from"));
+		}
+		let client_id = uuid::Uuid::new_v4().to_string();
+		// Own a copy of every local file, so the app's temporary files can go.
+		let dir = actions::outbox_dir(&self.inner.data_dir, &client_id);
+		for (index, attachment) in message.attachments.iter_mut().enumerate() {
+			let Some(path) = attachment.file_path.clone() else { continue };
+			std::fs::create_dir_all(&dir).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+			let target = dir.join(format!("{index}"));
+			std::fs::copy(&path, &target)
+				.map_err(|e| CoreError::Storage { message: format!("Couldn't attach {}: {e}", attachment.name) })?;
+			attachment.file_path = Some(target.to_string_lossy().into_owned());
+		}
+		let summary = serde_json::to_string(&actions::OutboxSummary::of(&message))?;
+		let payload = serde_json::to_string(&actions::OutgoingAction {
+			message,
+			send,
+			uploaded: vec![],
+			draft_id: None,
+			submit_attempted: false,
+		})?;
+		self.inner.store.enqueue(&account_id, &client_id, if send { "send" } else { "draft" }, &payload, &summary)?;
+		self.inner.emit(CoreEvent::OutboxChanged { account_id: account_id.clone() });
+		self.schedule_flush(account_id);
+		Ok(client_id)
+	}
+
+	async fn detail_for(&self, account_id: String, message_id: String) -> Result<MessageDetail> {
+		if let Some(detail) = self.inner.store.detail(&account_id, &message_id)? {
+			if detail.message_id.is_some() || detail.summary.mailbox_id.ends_with("~drafts") {
+				return Ok(detail);
+			}
+		}
+		self.load_message(account_id, message_id).await
+	}
+}
+
+/// Milestone 2: composing, moving, deleting, attachments and server search.
+#[uniffi::export]
+impl MailCore {
+	/// Known correspondents matching `prefix`, for the recipient fields.
+	pub fn suggest_contacts(&self, account_id: String, prefix: String, limit: u32) -> Result<Vec<EmailAddress>> {
+		self.inner.store.suggest_contacts(&account_id, &prefix, limit.min(50))
+	}
+
+	/// Addresses the account may send from.
+	pub fn identities(&self, account_id: String) -> Result<Vec<Identity>> {
+		self.inner.store.identities(&account_id)
+	}
+
+	/// A prefilled composer for replying to or forwarding `message_id`.
+	pub async fn compose_template(&self, account_id: String, message_id: String, kind: ReplyKind) -> Result<ComposeTemplate> {
+		let detail = self.detail_for(account_id.clone(), message_id).await?;
+		Ok(compose::template(&detail, kind, &self.inner.store.identities(&account_id)?))
+	}
+
+	/// A stored draft, reopened for editing. Saving or sending replaces it.
+	pub async fn draft_template(&self, account_id: String, message_id: String) -> Result<ComposeTemplate> {
+		let detail = self.detail_for(account_id.clone(), message_id).await?;
+		Ok(compose::draft_template(&detail, &self.inner.store.identities(&account_id)?))
+	}
+
+	/// Queues a message for sending and returns its outbox id. It is sent as
+	/// soon as the server is reachable; failures stay in the outbox.
+	pub fn send(&self, account_id: String, message: OutgoingMessage) -> Result<String> {
+		self.enqueue_outgoing(account_id, message, true)
+	}
+
+	/// Queues saving a draft to the server's Drafts.
+	pub fn save_draft(&self, account_id: String, message: OutgoingMessage) -> Result<String> {
+		self.enqueue_outgoing(account_id, message, false)
+	}
+
+	pub fn outbox(&self, account_id: String) -> Result<Vec<OutboxItem>> {
+		Ok(self.inner.store.pending_actions(&account_id)?.iter().filter_map(actions::outbox_item).collect())
+	}
+
+	/// Retries a stalled outbox item now.
+	pub fn retry_outbox_item(&self, account_id: String, client_id: String) -> Result<()> {
+		self.inner.store.reset_action(&account_id, &client_id)?;
+		self.inner.emit(CoreEvent::OutboxChanged { account_id: account_id.clone() });
+		self.schedule_flush(account_id);
+		Ok(())
+	}
+
+	/// Drops an outbox item that has not been sent. A partially stored draft
+	/// on the server is left for the user to delete.
+	pub fn discard_outbox_item(&self, account_id: String, client_id: String) -> Result<()> {
+		self.inner.store.delete_action(&account_id, &client_id)?;
+		let _ = std::fs::remove_dir_all(actions::outbox_dir(&self.inner.data_dir, &client_id));
+		self.inner.emit(CoreEvent::OutboxChanged { account_id });
+		Ok(())
+	}
+
+	/// Moves messages. A role target resolves per message to that role's
+	/// mailbox for the same address; messages already there are skipped.
+	pub fn move_messages(&self, account_id: String, message_ids: Vec<String>, target: MoveTarget) -> Result<u32> {
+		let mut moves = std::collections::BTreeMap::new();
+		for id in &message_ids {
+			let Some(summary) = self.inner.store.summary(&account_id, id)? else { continue };
+			let destination = match &target {
+				MoveTarget::Mailbox { id } => Some(id.clone()),
+				MoveTarget::Role { role } => self.inner.store.sibling_with_role(&account_id, &summary.mailbox_id, role)?,
+			};
+			if let Some(destination) = destination.filter(|d| d != &summary.mailbox_id) {
+				moves.insert(id.clone(), destination);
+			}
+		}
+		if moves.is_empty() {
+			return Ok(0);
+		}
+		let client_id = uuid::Uuid::new_v4().to_string();
+		let pairs: Vec<(String, String)> = moves.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+		let payload = serde_json::to_string(&actions::MoveAction { moves })?;
+		let changed = self.inner.store.apply_move(&account_id, &pairs, &client_id, &payload)?;
+		if changed > 0 {
+			self.inner.emit(CoreEvent::MessagesChanged { account_id: account_id.clone() });
+			self.inner.emit(CoreEvent::MailboxesChanged { account_id: account_id.clone() });
+			self.schedule_flush(account_id);
+		}
+		Ok(changed as u32)
+	}
+
+	/// Moves messages to Trash; messages already in Trash or Drafts are
+	/// deleted permanently. Returns how many were deleted permanently.
+	pub fn delete_messages(&self, account_id: String, message_ids: Vec<String>) -> Result<u32> {
+		let mut permanent = Vec::new();
+		let mut to_trash = Vec::new();
+		for id in message_ids {
+			let Some(summary) = self.inner.store.summary(&account_id, &id)? else { continue };
+			match self.inner.store.mailbox_role(&account_id, &summary.mailbox_id)?.as_deref() {
+				Some("trash") | Some("drafts") => permanent.push(id),
+				_ => to_trash.push(id),
+			}
+		}
+		if !to_trash.is_empty() {
+			self.move_messages(account_id.clone(), to_trash, MoveTarget::Role { role: "trash".into() })?;
+		}
+		if permanent.is_empty() {
+			return Ok(0);
+		}
+		let client_id = uuid::Uuid::new_v4().to_string();
+		let payload = serde_json::to_string(&actions::DestroyAction { ids: permanent.clone() })?;
+		let changed = self.inner.store.apply_destroy(&account_id, &permanent, &client_id, &payload)?;
+		if changed > 0 {
+			self.inner.emit(CoreEvent::MessagesChanged { account_id: account_id.clone() });
+			self.inner.emit(CoreEvent::MailboxesChanged { account_id: account_id.clone() });
+			self.schedule_flush(account_id);
+		}
+		Ok(changed as u32)
+	}
+
+	/// Searches the server (mail outside the synced windows). Results are
+	/// cached, so local search finds them afterwards.
+	pub async fn search_server(&self, account_id: String, query: String, limit: u32) -> Result<Vec<MessageSummary>> {
+		self.run(move |inner| async move {
+			if query.trim().is_empty() {
+				return Ok(vec![]);
+			}
+			let ctx = inner.context(&account_id)?;
+			sync::search_server(&ctx, &account_id, query.trim(), limit).await
+		})
+		.await
+	}
+
+	/// Downloads an attachment into the core's cache and returns the file
+	/// path. A cached file is returned without the network.
+	pub async fn download_attachment(&self, account_id: String, attachment: Attachment) -> Result<String> {
+		self.run(move |inner| async move {
+			let safe = |value: &str| -> String {
+				let cleaned: String = value.chars().map(|c| if c == '/' || c == '\\' || c == ':' || c.is_control() { '_' } else { c }).collect();
+				let trimmed = cleaned.trim_start_matches('.').trim().to_string();
+				if trimmed.is_empty() { "attachment".into() } else { trimmed }
+			};
+			let dir = inner.data_dir.join("attachments").join(&account_id).join(safe(&attachment.blob_id));
+			let name = safe(attachment.name.as_deref().unwrap_or("attachment"));
+			let path = dir.join(&name);
+			if path.exists() {
+				return Ok(path.to_string_lossy().into_owned());
+			}
+			let ctx = inner.context(&account_id)?;
+			let bytes = ctx.download(&attachment.blob_id, &name, &attachment.mime_type).await?;
+			std::fs::create_dir_all(&dir).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+			let partial = dir.join(format!(".{name}.part"));
+			std::fs::write(&partial, bytes).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+			std::fs::rename(&partial, &path).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+			Ok(path.to_string_lossy().into_owned())
+		})
+		.await
 	}
 }

@@ -8,9 +8,9 @@ use std::sync::Mutex;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::error::Result;
-use crate::types::{Account, Attachment, EmailAddress, Folder, Mailbox, MessageDetail, MessageSummary};
+use crate::types::{Account, Attachment, EmailAddress, Folder, Identity, Mailbox, MessageDetail, MessageSummary};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -104,8 +104,28 @@ CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, from_name, from_emai
 END;
 "#;
 
+const SCHEMA_V2: &str = r#"
+ALTER TABLE accounts ADD COLUMN upload_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE bodies ADD COLUMN message_id TEXT;
+ALTER TABLE bodies ADD COLUMN references_json TEXT NOT NULL DEFAULT '[]';
+-- Short JSON shown in the outbox (subject, recipients) for send and draft actions.
+ALTER TABLE actions ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE identities (
+	account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	id TEXT NOT NULL,
+	name TEXT NOT NULL DEFAULT '',
+	email TEXT NOT NULL,
+	PRIMARY KEY (account_id, id)
+);
+"#;
+
+const SCHEMA_V3: &str = r#"
+ALTER TABLE messages ADD COLUMN to_display TEXT NOT NULL DEFAULT '';
+"#;
+
 const SUMMARY_COLUMNS: &str =
-	"id, thread_id, mailbox_id, from_name, from_email, subject, preview, received_at, seen, flagged, has_attachment";
+	"id, thread_id, mailbox_id, from_name, from_email, subject, preview, received_at, seen, flagged, has_attachment, to_display";
 
 /// Everything the JMAP client needs to talk to an account's server.
 #[derive(Debug, Clone)]
@@ -113,6 +133,9 @@ pub struct AccountEndpoint {
 	pub email: String,
 	pub api_url: String,
 	pub jmap_account_id: String,
+	pub session_url: String,
+	pub download_url: String,
+	pub upload_url: String,
 }
 
 pub struct NewAccount<'a> {
@@ -123,6 +146,7 @@ pub struct NewAccount<'a> {
 	pub session_url: &'a str,
 	pub api_url: &'a str,
 	pub download_url: &'a str,
+	pub upload_url: &'a str,
 	pub jmap_account_id: &'a str,
 }
 
@@ -134,6 +158,7 @@ pub struct StoredMessage {
 	pub mailbox_id: String,
 	pub from_name: String,
 	pub from_email: String,
+	pub to_display: String,
 	pub subject: String,
 	pub preview: String,
 	pub received_at: i64,
@@ -150,6 +175,9 @@ pub struct StoredBody {
 	pub cc: Vec<EmailAddress>,
 	pub reply_to: Vec<EmailAddress>,
 	pub attachments: Vec<Attachment>,
+	/// The message's Message-ID, without angle brackets.
+	pub message_id: Option<String>,
+	pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +186,9 @@ pub struct PendingAction {
 	pub client_id: String,
 	pub kind: String,
 	pub payload: String,
+	pub attempts: u32,
+	pub last_error: Option<String>,
+	pub summary: String,
 }
 
 pub struct Store {
@@ -190,6 +221,7 @@ fn summary_from_row(row: &Row) -> rusqlite::Result<MessageSummary> {
 		seen: row.get(8)?,
 		flagged: row.get(9)?,
 		has_attachment: row.get(10)?,
+		to_display: row.get(11)?,
 	})
 }
 
@@ -246,11 +278,11 @@ impl Store {
 	pub fn insert_account(&self, account: NewAccount) -> Result<()> {
 		self.write(|conn| {
 			conn.execute(
-				"INSERT INTO accounts (id, email, display_name, server_url, session_url, api_url, download_url, jmap_account_id, created_at)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+				"INSERT INTO accounts (id, email, display_name, server_url, session_url, api_url, download_url, jmap_account_id, created_at, upload_url)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 				 ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, server_url = excluded.server_url,
 				 	session_url = excluded.session_url, api_url = excluded.api_url, download_url = excluded.download_url,
-				 	jmap_account_id = excluded.jmap_account_id",
+				 	jmap_account_id = excluded.jmap_account_id, upload_url = excluded.upload_url",
 				params![
 					account.id,
 					account.email,
@@ -260,7 +292,8 @@ impl Store {
 					account.api_url,
 					account.download_url,
 					account.jmap_account_id,
-					now()
+					now(),
+					account.upload_url
 				],
 			)?;
 			Ok(())
@@ -292,9 +325,18 @@ impl Store {
 	pub fn endpoint(&self, account_id: &str) -> Result<AccountEndpoint> {
 		self.read(|conn| {
 			conn.query_row(
-				"SELECT email, api_url, jmap_account_id FROM accounts WHERE id = ?1",
+				"SELECT email, api_url, jmap_account_id, session_url, download_url, upload_url FROM accounts WHERE id = ?1",
 				params![account_id],
-				|row| Ok(AccountEndpoint { email: row.get(0)?, api_url: row.get(1)?, jmap_account_id: row.get(2)? }),
+				|row| {
+					Ok(AccountEndpoint {
+						email: row.get(0)?,
+						api_url: row.get(1)?,
+						jmap_account_id: row.get(2)?,
+						session_url: row.get(3)?,
+						download_url: row.get(4)?,
+						upload_url: row.get(5)?,
+					})
+				},
 			)
 			.optional()?
 			.ok_or_else(|| crate::error::CoreError::not_found("Account not found"))
@@ -471,34 +513,42 @@ impl Store {
 		self.count(account_id, &Folder::Mailbox { id: mailbox_id.to_string() }, false)
 	}
 
-	/// Upserts server rows. Messages with a queued keyword change keep their
-	/// local `seen`/`flagged` until the queue flushes, so a sync never flickers
-	/// an action the user just took.
+	/// Upserts server rows. Messages with a queued keyword change or move keep
+	/// their local `seen`/`flagged`/`mailbox_id` until the queue flushes, so a
+	/// sync never flickers an action the user just took.
 	pub fn upsert_messages(&self, account_id: &str, rows: &[StoredMessage]) -> Result<()> {
 		self.write(|conn| {
 			let tx = conn.transaction()?;
 			{
 				let mut upsert = tx.prepare_cached(
 					"INSERT INTO messages (account_id, id, thread_id, mailbox_id, from_name, from_email, subject, preview,
-					 	received_at, seen, flagged, has_attachment, size)
-					 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-					 ON CONFLICT (account_id, id) DO UPDATE SET thread_id = excluded.thread_id, mailbox_id = excluded.mailbox_id,
+					 	received_at, seen, flagged, has_attachment, size, to_display)
+					 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?15)
+					 ON CONFLICT (account_id, id) DO UPDATE SET thread_id = excluded.thread_id,
 					 	from_name = excluded.from_name, from_email = excluded.from_email, subject = excluded.subject,
 					 	preview = excluded.preview, received_at = excluded.received_at,
+					 	mailbox_id = CASE WHEN ?14 THEN messages.mailbox_id ELSE excluded.mailbox_id END,
 					 	seen = CASE WHEN ?14 THEN messages.seen ELSE excluded.seen END,
 					 	flagged = CASE WHEN ?14 THEN messages.flagged ELSE excluded.flagged END,
-					 	has_attachment = excluded.has_attachment, size = excluded.size
+					 	has_attachment = excluded.has_attachment, size = excluded.size, to_display = excluded.to_display
 					 WHERE messages.thread_id IS NOT excluded.thread_id OR messages.mailbox_id IS NOT excluded.mailbox_id
 					 	OR messages.subject IS NOT excluded.subject OR messages.preview IS NOT excluded.preview
 					 	OR messages.from_name IS NOT excluded.from_name OR messages.received_at IS NOT excluded.received_at
 					 	OR messages.seen IS NOT excluded.seen OR messages.flagged IS NOT excluded.flagged
-					 	OR messages.has_attachment IS NOT excluded.has_attachment",
+					 	OR messages.has_attachment IS NOT excluded.has_attachment OR messages.to_display IS NOT excluded.to_display",
 				)?;
 				let mut pending = tx.prepare_cached(
-					"SELECT 1 FROM actions WHERE account_id = ?1 AND kind = 'keywords' AND payload LIKE ?2 LIMIT 1",
+					"SELECT 1 FROM actions WHERE account_id = ?1 AND kind IN ('keywords', 'move') AND payload LIKE ?2 LIMIT 1",
 				)?;
+				let mut destroying =
+					tx.prepare_cached("SELECT 1 FROM actions WHERE account_id = ?1 AND kind = 'destroy' AND payload LIKE ?2 LIMIT 1")?;
 				for row in rows {
-					let has_pending = pending.exists(params![account_id, format!("%\"{}\"%", row.id)])?;
+					let pattern = format!("%\"{}\"%", row.id);
+					// Deleted here but not yet on the server: don't resurrect it.
+					if destroying.exists(params![account_id, pattern])? {
+						continue;
+					}
+					let has_pending = pending.exists(params![account_id, pattern])?;
 					upsert.execute(params![
 						account_id,
 						row.id,
@@ -513,7 +563,8 @@ impl Store {
 						row.flagged,
 						row.has_attachment,
 						row.size,
-						has_pending
+						has_pending,
+						row.to_display
 					])?;
 				}
 			}
@@ -598,9 +649,17 @@ impl Store {
 	pub fn pending_actions(&self, account_id: &str) -> Result<Vec<PendingAction>> {
 		self.read(|conn| {
 			let mut stmt =
-				conn.prepare_cached("SELECT seq, client_id, kind, payload FROM actions WHERE account_id = ?1 ORDER BY seq")?;
+				conn.prepare_cached("SELECT seq, client_id, kind, payload, attempts, last_error, summary FROM actions WHERE account_id = ?1 ORDER BY seq")?;
 			let rows = stmt.query_map(params![account_id], |row| {
-				Ok(PendingAction { seq: row.get(0)?, client_id: row.get(1)?, kind: row.get(2)?, payload: row.get(3)? })
+				Ok(PendingAction {
+					seq: row.get(0)?,
+					client_id: row.get(1)?,
+					kind: row.get(2)?,
+					payload: row.get(3)?,
+					attempts: row.get(4)?,
+					last_error: row.get(5)?,
+					summary: row.get(6)?,
+				})
 			})?;
 			Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 		})
@@ -629,7 +688,7 @@ impl Store {
 		self.read(|conn| {
 			let row = conn
 				.query_row(
-					"SELECT html, has_remote_content, to_json, cc_json, reply_to_json, attachments_json
+					"SELECT html, has_remote_content, to_json, cc_json, reply_to_json, attachments_json, message_id, references_json
 					 FROM bodies WHERE account_id = ?1 AND id = ?2",
 					params![account_id, message_id],
 					|row| {
@@ -640,17 +699,21 @@ impl Store {
 							row.get::<_, String>(3)?,
 							row.get::<_, String>(4)?,
 							row.get::<_, String>(5)?,
+							row.get::<_, Option<String>>(6)?,
+							row.get::<_, String>(7)?,
 						))
 					},
 				)
 				.optional()?;
-			Ok(row.map(|(html, has_remote_content, to, cc, reply_to, attachments)| StoredBody {
+			Ok(row.map(|(html, has_remote_content, to, cc, reply_to, attachments, message_id, references)| StoredBody {
 				html,
 				has_remote_content,
 				to: serde_json::from_str(&to).unwrap_or_default(),
 				cc: serde_json::from_str(&cc).unwrap_or_default(),
 				reply_to: serde_json::from_str(&reply_to).unwrap_or_default(),
 				attachments: serde_json::from_str(&attachments).unwrap_or_default(),
+				message_id,
+				references: serde_json::from_str(&references).unwrap_or_default(),
 			}))
 		})
 	}
@@ -660,14 +723,29 @@ impl Store {
 		let cc = serde_json::to_string(&body.cc)?;
 		let reply_to = serde_json::to_string(&body.reply_to)?;
 		let attachments = serde_json::to_string(&body.attachments)?;
+		let references = serde_json::to_string(&body.references)?;
 		self.write(|conn| {
 			conn.execute(
-				"INSERT INTO bodies (account_id, id, html, has_remote_content, to_json, cc_json, reply_to_json, attachments_json, fetched_at)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+				"INSERT INTO bodies (account_id, id, html, has_remote_content, to_json, cc_json, reply_to_json, attachments_json,
+				 	message_id, references_json, fetched_at)
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 				 ON CONFLICT (account_id, id) DO UPDATE SET html = excluded.html, has_remote_content = excluded.has_remote_content,
 				 	to_json = excluded.to_json, cc_json = excluded.cc_json, reply_to_json = excluded.reply_to_json,
-				 	attachments_json = excluded.attachments_json, fetched_at = excluded.fetched_at",
-				params![account_id, message_id, body.html, body.has_remote_content, to, cc, reply_to, attachments, now()],
+				 	attachments_json = excluded.attachments_json, message_id = excluded.message_id,
+				 	references_json = excluded.references_json, fetched_at = excluded.fetched_at",
+				params![
+					account_id,
+					message_id,
+					body.html,
+					body.has_remote_content,
+					to,
+					cc,
+					reply_to,
+					attachments,
+					body.message_id,
+					references,
+					now()
+				],
 			)?;
 			Ok(())
 		})
@@ -684,14 +762,218 @@ impl Store {
 			html: body.html,
 			has_remote_content: body.has_remote_content,
 			attachments: body.attachments,
+			message_id: body.message_id,
+			references: body.references,
 		}))
+	}
+}
+
+/// Milestone 2: identities, moves, deletes and the send/draft outbox.
+impl Store {
+	/// Refreshes the URLs from a re-fetched session (accounts added before
+	/// uploads existed have none).
+	pub fn update_session_urls(&self, account_id: &str, api_url: &str, download_url: &str, upload_url: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute(
+				"UPDATE accounts SET api_url = ?2, download_url = ?3, upload_url = ?4 WHERE id = ?1",
+				params![account_id, api_url, download_url, upload_url],
+			)?;
+			Ok(())
+		})
+	}
+
+	/// Addresses seen as senders, best match first, for recipient completion.
+	pub fn suggest_contacts(&self, account_id: &str, prefix: &str, limit: u32) -> Result<Vec<EmailAddress>> {
+		let prefix = prefix.trim().to_lowercase().replace(['%', '_'], "");
+		if prefix.is_empty() {
+			return Ok(vec![]);
+		}
+		self.read(|conn| {
+			let mut stmt = conn.prepare_cached(
+				"SELECT from_email, max(from_name), count(*) AS uses FROM messages
+				 WHERE account_id = ?1 AND from_email != ''
+				 	AND (lower(from_email) LIKE ?2 || '%' OR lower(from_name) LIKE ?2 || '%' OR lower(from_name) LIKE '% ' || ?2 || '%')
+				 GROUP BY lower(from_email) ORDER BY uses DESC, from_email LIMIT ?3",
+			)?;
+			let rows = stmt.query_map(params![account_id, prefix, limit], |row| {
+				let name: String = row.get(1)?;
+				Ok(EmailAddress { email: row.get(0)?, name: (!name.is_empty()).then_some(name) })
+			})?;
+			Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+		})
+	}
+
+	pub fn replace_identities(&self, account_id: &str, identities: &[Identity]) -> Result<()> {
+		self.write(|conn| {
+			let tx = conn.transaction()?;
+			tx.execute("DELETE FROM identities WHERE account_id = ?1", params![account_id])?;
+			{
+				let mut insert = tx.prepare_cached("INSERT OR REPLACE INTO identities (account_id, id, name, email) VALUES (?1, ?2, ?3, ?4)")?;
+				for identity in identities {
+					insert.execute(params![account_id, identity.id, identity.name, identity.email])?;
+				}
+			}
+			tx.commit()?;
+			Ok(())
+		})
+	}
+
+	pub fn identities(&self, account_id: &str) -> Result<Vec<Identity>> {
+		self.read(|conn| {
+			let mut stmt = conn.prepare_cached("SELECT id, name, email FROM identities WHERE account_id = ?1 ORDER BY email")?;
+			let rows = stmt.query_map(params![account_id], |row| Ok(Identity { id: row.get(0)?, name: row.get(1)?, email: row.get(2)? }))?;
+			Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+		})
+	}
+
+	/// The mailbox with `role` that shares `mailbox_id`'s parent (Mailflare
+	/// keeps one set of system mailboxes per address).
+	pub fn sibling_with_role(&self, account_id: &str, mailbox_id: &str, role: &str) -> Result<Option<String>> {
+		self.read(|conn| {
+			Ok(conn
+				.query_row(
+					"SELECT s.id FROM mailboxes m JOIN mailboxes s ON s.account_id = m.account_id
+					 	AND s.parent_id IS coalesce(m.parent_id, m.id) AND s.role = ?3
+					 WHERE m.account_id = ?1 AND m.id = ?2",
+					params![account_id, mailbox_id, role],
+					|row| row.get(0),
+				)
+				.optional()?)
+		})
+	}
+
+	pub fn mailbox_role(&self, account_id: &str, mailbox_id: &str) -> Result<Option<String>> {
+		self.read(|conn| {
+			Ok(conn
+				.query_row("SELECT role FROM mailboxes WHERE account_id = ?1 AND id = ?2", params![account_id, mailbox_id], |row| row.get(0))
+				.optional()?
+				.flatten())
+		})
+	}
+
+	pub fn enqueue(&self, account_id: &str, client_id: &str, kind: &str, payload: &str, summary: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute(
+				"INSERT INTO actions (client_id, account_id, kind, payload, summary, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+				params![client_id, account_id, kind, payload, summary, now()],
+			)?;
+			Ok(())
+		})
+	}
+
+	/// Persists progress of a multi-step action (uploaded blobs, created draft id)
+	/// so a replay resumes instead of repeating server writes.
+	pub fn update_action_payload(&self, seq: i64, payload: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute("UPDATE actions SET payload = ?2 WHERE seq = ?1", params![seq, payload])?;
+			Ok(())
+		})
+	}
+
+	pub fn delete_action(&self, account_id: &str, client_id: &str) -> Result<Option<String>> {
+		self.write(|conn| {
+			let payload: Option<String> = conn
+				.query_row("SELECT payload FROM actions WHERE account_id = ?1 AND client_id = ?2", params![account_id, client_id], |row| {
+					row.get(0)
+				})
+				.optional()?;
+			conn.execute("DELETE FROM actions WHERE account_id = ?1 AND client_id = ?2", params![account_id, client_id])?;
+			Ok(payload)
+		})
+	}
+
+	pub fn reset_action(&self, account_id: &str, client_id: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute(
+				"UPDATE actions SET attempts = 0, last_error = NULL WHERE account_id = ?1 AND client_id = ?2",
+				params![account_id, client_id],
+			)?;
+			Ok(())
+		})
+	}
+
+	/// Moves messages locally and queues the server move in one transaction.
+	/// `moves` pairs message ids with target mailbox ids.
+	pub fn apply_move(&self, account_id: &str, moves: &[(String, String)], client_id: &str, payload: &str) -> Result<usize> {
+		self.write(|conn| {
+			let tx = conn.transaction()?;
+			let mut changed = 0;
+			{
+				let mut select = tx.prepare_cached("SELECT mailbox_id, seen FROM messages WHERE account_id = ?1 AND id = ?2")?;
+				let mut update = tx.prepare_cached("UPDATE messages SET mailbox_id = ?3 WHERE account_id = ?1 AND id = ?2")?;
+				let mut adjust = tx.prepare_cached(
+					"UPDATE mailboxes SET unread_emails = max(0, unread_emails + ?3), total_emails = max(0, total_emails + ?4)
+					 WHERE account_id = ?1 AND id = ?2",
+				)?;
+				for (id, target) in moves {
+					let current: Option<(String, bool)> =
+						select.query_row(params![account_id, id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+					let Some((from, seen)) = current else { continue };
+					if &from == target {
+						continue;
+					}
+					update.execute(params![account_id, id, target])?;
+					let unread = if seen { 0 } else { 1 };
+					adjust.execute(params![account_id, from, -unread, -1])?;
+					adjust.execute(params![account_id, target, unread, 1])?;
+					changed += 1;
+				}
+			}
+			if changed > 0 {
+				tx.execute(
+					"INSERT INTO actions (client_id, account_id, kind, payload, created_at) VALUES (?1, ?2, 'move', ?3, ?4)",
+					params![client_id, account_id, payload, now()],
+				)?;
+			}
+			tx.commit()?;
+			Ok(changed)
+		})
+	}
+
+	/// Deletes messages locally (permanently) and queues the server destroy.
+	pub fn apply_destroy(&self, account_id: &str, ids: &[String], client_id: &str, payload: &str) -> Result<usize> {
+		self.write(|conn| {
+			let tx = conn.transaction()?;
+			let mut changed = 0;
+			{
+				let mut select = tx.prepare_cached("SELECT mailbox_id, seen FROM messages WHERE account_id = ?1 AND id = ?2")?;
+				let mut delete = tx.prepare_cached("DELETE FROM messages WHERE account_id = ?1 AND id = ?2")?;
+				let mut adjust = tx.prepare_cached(
+					"UPDATE mailboxes SET unread_emails = max(0, unread_emails - ?3), total_emails = max(0, total_emails - 1)
+					 WHERE account_id = ?1 AND id = ?2",
+				)?;
+				for id in ids {
+					let current: Option<(String, bool)> =
+						select.query_row(params![account_id, id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+					let Some((mailbox, seen)) = current else { continue };
+					tx.execute("DELETE FROM bodies WHERE account_id = ?1 AND id = ?2", params![account_id, id])?;
+					delete.execute(params![account_id, id])?;
+					adjust.execute(params![account_id, mailbox, if seen { 0 } else { 1 }])?;
+					changed += 1;
+				}
+			}
+			if changed > 0 {
+				tx.execute(
+					"INSERT INTO actions (client_id, account_id, kind, payload, created_at) VALUES (?1, ?2, 'destroy', ?3, ?4)",
+					params![client_id, account_id, payload, now()],
+				)?;
+			}
+			tx.commit()?;
+			Ok(changed)
+		})
 	}
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
 	let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 	if version < 1 {
-		conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"))?;
+	}
+	if version < 2 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"))?;
+	}
+	if version < 3 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
 	}
 	Ok(())
 }
@@ -707,6 +989,7 @@ mod tests {
 			mailbox_id: mailbox.into(),
 			from_name: "Ann Example".into(),
 			from_email: "ann@example.com".into(),
+			to_display: String::new(),
 			subject: format!("Subject {id}"),
 			preview: "Quarterly numbers inside".into(),
 			received_at,
@@ -729,6 +1012,7 @@ mod tests {
 				session_url: "https://x.com/jmap/session",
 				api_url: "https://x.com/jmap/api",
 				download_url: "",
+				upload_url: "",
 				jmap_account_id: "u1",
 			})
 			.unwrap();
@@ -791,5 +1075,24 @@ mod tests {
 		store.delete_account("a").unwrap();
 		assert!(store.accounts().unwrap().is_empty());
 		assert!(store.summary("a", "m1").unwrap().is_none());
+	}
+
+	#[test]
+	fn moves_and_deletes_survive_sync_until_flushed() {
+		let (_dir, store) = store();
+		store.upsert_messages("a", &[message("m1", "mb~inbox", 1), message("m2", "mb~inbox", 2)]).unwrap();
+		assert_eq!(store.sibling_with_role("a", "mb~inbox", "trash").unwrap().as_deref(), Some("mb~trash"));
+		store.apply_move("a", &[("m1".into(), "mb~trash".into())], "c1", "{\"moves\":{\"m1\":\"mb~trash\"}}").unwrap();
+		store.apply_destroy("a", &["m2".into()], "c2", "{\"ids\":[\"m2\"]}").unwrap();
+		// The server still reports the old state.
+		store.upsert_messages("a", &[message("m1", "mb~inbox", 1), message("m2", "mb~inbox", 2)]).unwrap();
+		assert_eq!(store.summary("a", "m1").unwrap().unwrap().mailbox_id, "mb~trash");
+		assert!(store.summary("a", "m2").unwrap().is_none());
+		// Once flushed, the server's state wins again.
+		for action in store.pending_actions("a").unwrap() {
+			store.complete_action(action.seq).unwrap();
+		}
+		store.upsert_messages("a", &[message("m1", "mb~inbox", 1)]).unwrap();
+		assert_eq!(store.summary("a", "m1").unwrap().unwrap().mailbox_id, "mb~inbox");
 	}
 }

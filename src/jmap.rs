@@ -10,6 +10,7 @@ use crate::error::{CoreError, Result};
 
 pub const CAPABILITY_CORE: &str = "urn:ietf:params:jmap:core";
 pub const CAPABILITY_MAIL: &str = "urn:ietf:params:jmap:mail";
+pub const CAPABILITY_SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 
 #[derive(Debug, Clone)]
 pub struct Credentials {
@@ -31,6 +32,7 @@ pub struct Session {
 	pub session_url: String,
 	pub api_url: String,
 	pub download_url: String,
+	pub upload_url: String,
 	pub account_id: String,
 	pub account_name: String,
 }
@@ -117,10 +119,12 @@ pub async fn fetch_session(http: &reqwest::Client, session_url: &str, credential
 		.to_string();
 	let api_url = body["apiUrl"].as_str().ok_or_else(|| CoreError::server("Session has no apiUrl"))?;
 	let download_url = body["downloadUrl"].as_str().unwrap_or_default();
+	let upload_url = body["uploadUrl"].as_str().unwrap_or_default();
 	Ok(Session {
 		session_url: final_url.to_string(),
 		api_url: absolute(&final_url, api_url)?,
 		download_url: if download_url.is_empty() { String::new() } else { absolute(&final_url, download_url)? },
+		upload_url: if upload_url.is_empty() { String::new() } else { absolute(&final_url, upload_url)? },
 		account_name: body["accounts"][&account_id]["name"].as_str().unwrap_or_default().to_string(),
 		account_id,
 	})
@@ -135,7 +139,7 @@ pub async fn request(
 	calls: Vec<(String, Value, String)>,
 ) -> Result<Vec<Invocation>> {
 	let body = json!({
-		"using": [CAPABILITY_CORE, CAPABILITY_MAIL],
+		"using": [CAPABILITY_CORE, CAPABILITY_MAIL, CAPABILITY_SUBMISSION],
 		"methodCalls": calls.into_iter().map(|(name, args, id)| json!([name, args, id])).collect::<Vec<_>>(),
 	});
 	let response = http
@@ -165,6 +169,56 @@ pub async fn request(
 			})
 		})
 		.collect())
+}
+
+/// Expands an RFC 6570 level-1 template such as Mailflare's
+/// `downloadUrl`: `{name}` values are percent-encoded.
+pub fn expand_template(template: &str, values: &[(&str, &str)]) -> String {
+	let mut out = template.to_string();
+	for (key, value) in values {
+		let encoded: String = url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>().replace('+', "%20");
+		// URL parsing percent-encodes the braces of a stored template.
+		for pattern in [format!("{{{key}}}"), format!("%7B{key}%7D"), format!("%7b{key}%7d")] {
+			out = out.replace(&pattern, &encoded);
+		}
+	}
+	out
+}
+
+pub async fn upload(http: &reqwest::Client, upload_url: &str, credentials: &Credentials, bytes: Vec<u8>, mime_type: &str, name: &str) -> Result<String> {
+	let encoded: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>().replace('+', "%20");
+	let response = http
+		.post(upload_url)
+		.header(reqwest::header::AUTHORIZATION, credentials.authorization())
+		.header(reqwest::header::CONTENT_TYPE, mime_type)
+		.header(reqwest::header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{encoded}"))
+		.body(bytes)
+		.send()
+		.await?;
+	let status = response.status();
+	if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+		return Err(CoreError::Auth { message: "The server no longer accepts this app password.".into() });
+	}
+	if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+		return Err(CoreError::invalid(format!("{name} is too large to send")));
+	}
+	let value: Value = response.json().await.map_err(|_| CoreError::server(format!("Upload failed ({status})")))?;
+	value["blobId"].as_str().map(str::to_string).ok_or_else(|| CoreError::server(format!("Upload failed ({status})")))
+}
+
+pub async fn download(http: &reqwest::Client, url: &str, credentials: &Credentials) -> Result<Vec<u8>> {
+	let response = http.get(url).header(reqwest::header::AUTHORIZATION, credentials.authorization()).send().await?;
+	let status = response.status();
+	if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+		return Err(CoreError::Auth { message: "The server no longer accepts this app password.".into() });
+	}
+	if status == reqwest::StatusCode::NOT_FOUND {
+		return Err(CoreError::not_found("This attachment no longer exists"));
+	}
+	if !status.is_success() {
+		return Err(CoreError::server(format!("Download failed ({status})")));
+	}
+	Ok(response.bytes().await?.to_vec())
 }
 
 /// The response to `call_id` named `name`, or the method-level error.
@@ -205,6 +259,13 @@ mod tests {
 			session_candidates("me@x.com", Some("https://x.com/jmap/session")).unwrap(),
 			vec!["https://x.com/jmap/session"]
 		);
+	}
+
+	#[test]
+	fn expands_encoded_templates() {
+		let url = Url::parse("https://x.com/jmap/download/{accountId}/{blobId}/{name}?type={type}").unwrap().to_string();
+		let out = expand_template(&url, &[("accountId", "u1"), ("blobId", "att~1"), ("name", "a b.pdf"), ("type", "application/pdf")]);
+		assert_eq!(out, "https://x.com/jmap/download/u1/att%7E1/a%20b.pdf?type=application%2Fpdf");
 	}
 
 	#[test]

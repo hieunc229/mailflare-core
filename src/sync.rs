@@ -9,7 +9,7 @@ use crate::error::{CoreError, Result};
 use crate::jmap::{self, Credentials};
 use crate::sanitize;
 use crate::store::{AccountEndpoint, StoredBody, StoredMessage, Store};
-use crate::types::{Attachment, EmailAddress, Folder, Mailbox, MessageDetail};
+use crate::types::{Attachment, EmailAddress, Folder, Identity, Mailbox, MessageDetail, MessageSummary};
 
 /// Newest messages kept in sync per mailbox. Mailflare caps `maxObjectsInGet` at 200.
 pub const WINDOW: u32 = 200;
@@ -18,10 +18,11 @@ pub const PAGE: u32 = 100;
 /// Two calls per mailbox; Mailflare allows 32 calls per request.
 const MAILBOXES_PER_REQUEST: usize = 15;
 
-const SUMMARY_PROPERTIES: [&str; 10] =
-	["id", "threadId", "mailboxIds", "keywords", "from", "subject", "preview", "receivedAt", "hasAttachment", "size"];
+const SUMMARY_PROPERTIES: [&str; 11] =
+	["id", "threadId", "mailboxIds", "keywords", "from", "to", "subject", "preview", "receivedAt", "hasAttachment", "size"];
 
 pub struct Context<'a> {
+	pub account_id: String,
 	pub store: &'a Store,
 	pub http: &'a reqwest::Client,
 	pub endpoint: AccountEndpoint,
@@ -29,8 +30,31 @@ pub struct Context<'a> {
 }
 
 impl Context<'_> {
-	async fn call(&self, calls: Vec<(String, Value, String)>) -> Result<Vec<jmap::Invocation>> {
+	pub async fn call(&self, calls: Vec<(String, Value, String)>) -> Result<Vec<jmap::Invocation>> {
 		jmap::request(self.http, &self.endpoint.api_url, &self.credentials, calls).await
+	}
+
+	/// Download and upload URL templates. Accounts stored before uploads
+	/// existed have none, so the session is fetched again once.
+	async fn transfer_urls(&self) -> Result<(String, String)> {
+		if !self.endpoint.upload_url.is_empty() && !self.endpoint.download_url.is_empty() {
+			return Ok((self.endpoint.download_url.clone(), self.endpoint.upload_url.clone()));
+		}
+		let session = jmap::fetch_session(self.http, &self.endpoint.session_url, &self.credentials).await?;
+		self.store.update_session_urls(&self.account_id, &session.api_url, &session.download_url, &session.upload_url)?;
+		Ok((session.download_url, session.upload_url))
+	}
+
+	pub async fn download(&self, blob_id: &str, name: &str, mime_type: &str) -> Result<Vec<u8>> {
+		let (template, _) = self.transfer_urls().await?;
+		let url = jmap::expand_template(&template, &[("accountId", self.account()), ("blobId", blob_id), ("name", name), ("type", mime_type)]);
+		jmap::download(self.http, &url, &self.credentials).await
+	}
+
+	pub async fn upload(&self, bytes: Vec<u8>, mime_type: &str, name: &str) -> Result<String> {
+		let (_, template) = self.transfer_urls().await?;
+		let url = jmap::expand_template(&template, &[("accountId", self.account())]);
+		jmap::upload(self.http, &url, &self.credentials, bytes, mime_type, name).await
 	}
 
 	fn account(&self) -> &str {
@@ -77,7 +101,18 @@ pub fn parse_summary(email: &Value, preferred_mailbox: Option<&str>) -> Option<S
 	};
 	let from = parse_addresses(&email["from"]);
 	let sender = from.first();
+	let to = parse_addresses(&email["to"]);
+	let mut to_display = to
+		.iter()
+		.take(3)
+		.map(|a| a.name.clone().unwrap_or_else(|| a.email.split('@').next().unwrap_or_default().to_string()))
+		.collect::<Vec<_>>()
+		.join(", ");
+	if to.len() > 3 {
+		to_display.push_str(&format!(" +{}", to.len() - 3));
+	}
 	Some(StoredMessage {
+		to_display,
 		thread_id: email["threadId"].as_str().unwrap_or(&id).to_string(),
 		mailbox_id,
 		from_name: sender.and_then(|a| a.name.clone()).unwrap_or_default(),
@@ -148,8 +183,32 @@ fn read_page(responses: &[jmap::Invocation], tag: &str, mailbox: Option<&str>) -
 }
 
 pub async fn sync_mailboxes(ctx: &Context<'_>, account_id: &str) -> Result<Vec<Mailbox>> {
-	let responses = ctx.call(vec![("Mailbox/get".into(), json!({ "accountId": ctx.account(), "ids": null }), "m".into())]).await?;
+	let responses = ctx
+		.call(vec![
+			("Mailbox/get".into(), json!({ "accountId": ctx.account(), "ids": null }), "m".into()),
+			("Identity/get".into(), json!({ "accountId": ctx.account(), "ids": null }), "i".into()),
+		])
+		.await?;
 	let list = jmap::response(&responses, "m", "Mailbox/get")?;
+	// Identities are best-effort: a server without submission still syncs mail.
+	if let Ok(identities) = jmap::response(&responses, "i", "Identity/get") {
+		let identities: Vec<Identity> = identities["list"]
+			.as_array()
+			.map(|items| {
+				items
+					.iter()
+					.filter_map(|item| {
+						Some(Identity {
+							id: item["id"].as_str()?.to_string(),
+							name: item["name"].as_str().unwrap_or_default().to_string(),
+							email: item["email"].as_str()?.to_string(),
+						})
+					})
+					.collect()
+			})
+			.unwrap_or_default();
+		ctx.store.replace_identities(account_id, &identities)?;
+	}
 	let mailboxes: Vec<Mailbox> =
 		list["list"].as_array().map(|items| items.iter().filter_map(|item| parse_mailbox(account_id, item)).collect()).unwrap_or_default();
 	ctx.store.replace_mailboxes(account_id, &mailboxes)?;
@@ -230,7 +289,7 @@ fn body_html(email: &Value, parts_key: &str) -> Option<String> {
 
 pub async fn load_message(ctx: &Context<'_>, account_id: &str, message_id: &str) -> Result<MessageDetail> {
 	let mut properties: Vec<&str> = SUMMARY_PROPERTIES.to_vec();
-	properties.extend(["to", "cc", "replyTo", "htmlBody", "textBody", "attachments", "bodyValues"]);
+	properties.extend(["to", "cc", "replyTo", "htmlBody", "textBody", "attachments", "bodyValues", "messageId", "references"]);
 	let responses = ctx
 		.call(vec![(
 			"Email/get".into(),
@@ -275,63 +334,29 @@ pub async fn load_message(ctx: &Context<'_>, account_id: &str, message_id: &str)
 		cc: parse_addresses(&email["cc"]),
 		reply_to: parse_addresses(&email["replyTo"]),
 		attachments,
+		message_id: email["messageId"].as_array().and_then(|ids| ids.first()).and_then(Value::as_str).map(|id| id.trim_matches(['<', '>']).to_string()),
+		references: email["references"]
+			.as_array()
+			.map(|ids| ids.iter().filter_map(Value::as_str).map(|id| id.trim_matches(['<', '>']).to_string()).collect())
+			.unwrap_or_default(),
 	};
 	ctx.store.save_body(account_id, message_id, &body)?;
 	ctx.store.detail(account_id, message_id)?.ok_or_else(|| CoreError::not_found("This message no longer exists"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct KeywordAction {
-	pub ids: Vec<String>,
-	pub keyword: String,
-	pub value: bool,
-}
-
-/// Replays queued actions in order. Keyword patches are idempotent, so a
-/// replay after a lost response is harmless. Stops at the first transport
-/// error and leaves the rest queued.
-pub async fn flush_actions(ctx: &Context<'_>, account_id: &str) -> Result<u32> {
-	let mut flushed = 0;
-	for action in ctx.store.pending_actions(account_id)? {
-		if action.kind != "keywords" {
-			ctx.store.fail_action(action.seq, "Unknown action")?;
-			continue;
-		}
-		let Ok(payload) = serde_json::from_str::<KeywordAction>(&action.payload) else {
-			ctx.store.complete_action(action.seq)?;
-			continue;
-		};
-		let patch_value = if payload.value { json!(true) } else { Value::Null };
-		let update: serde_json::Map<String, Value> = payload
-			.ids
-			.iter()
-			.map(|id| (id.clone(), json!({ format!("keywords/{}", payload.keyword): patch_value.clone() })))
-			.collect();
-		let responses =
-			ctx.call(vec![("Email/set".into(), json!({ "accountId": ctx.account(), "update": update }), action.client_id.clone())]).await?;
-		match jmap::response(&responses, &action.client_id, "Email/set") {
-			Ok(result) => {
-				// notFound means the message is gone; nothing left to apply.
-				let failed: Vec<String> = result["notUpdated"]
-					.as_object()
-					.map(|map| {
-						map.iter()
-							.filter(|(_, err)| err["type"].as_str() != Some("notFound"))
-							.map(|(id, err)| format!("{id}: {}", err["type"].as_str().unwrap_or("error")))
-							.collect()
-					})
-					.unwrap_or_default();
-				if failed.is_empty() {
-					ctx.store.complete_action(action.seq)?;
-					flushed += 1;
-				} else {
-					ctx.store.fail_action(action.seq, &failed.join(", "))?;
-				}
-			}
-			Err(error) => ctx.store.fail_action(action.seq, &error.to_string())?,
+/// Full-text search on the server (`text` filter), for mail outside the
+/// synced windows. Results are cached like any other rows.
+pub async fn search_server(ctx: &Context<'_>, account_id: &str, query: &str, limit: u32) -> Result<Vec<MessageSummary>> {
+	let responses = ctx.call(query_and_get(ctx, "x", json!({ "text": query }), 0, limit.min(WINDOW))).await?;
+	let page = read_page(&responses, "x", None)?;
+	ctx.store.upsert_messages(account_id, &page.rows)?;
+	let mut results = Vec::with_capacity(page.ids.len());
+	for id in &page.ids {
+		if let Some(summary) = ctx.store.summary(account_id, id)? {
+			results.push(summary);
 		}
 	}
-	Ok(flushed)
+	Ok(results)
 }
 
 #[cfg(test)]

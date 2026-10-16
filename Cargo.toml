@@ -25,7 +25,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 ammonia = "4"
 url = "2"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [dev-dependencies]
 tempfile = "3"
