@@ -344,6 +344,65 @@ pub async fn load_message(ctx: &Context<'_>, account_id: &str, message_id: &str)
 	ctx.store.detail(account_id, message_id)?.ok_or_else(|| CoreError::not_found("This message no longer exists"))
 }
 
+/// The account's current Email state (an `Email/get` for no ids).
+pub async fn email_state(ctx: &Context<'_>) -> Result<Option<String>> {
+	let responses = ctx.call(vec![("Email/get".into(), json!({ "accountId": ctx.account(), "ids": [] }), "s".into())]).await?;
+	Ok(jmap::response(&responses, "s", "Email/get")?["state"].as_str().map(str::to_string))
+}
+
+/// Changes per `Email/changes` round. Each side (created, updated) fits one
+/// `Email/get`; Mailflare caps `maxObjectsInGet` at 200.
+const CHANGES_PAGE: u32 = 200;
+
+/// Applies `Email/changes` since `since` until the server has no more.
+/// Returns the new state, or `None` when the server cannot continue from
+/// `since` (unknown or expired state, or a server without a change log).
+pub async fn delta_sync(ctx: &Context<'_>, account_id: &str, since: &str) -> Result<Option<String>> {
+	let mut state = since.to_string();
+	for _ in 0..50 {
+		let get = |path: &str, call: &str| {
+			(
+				"Email/get".to_string(),
+				json!({
+					"accountId": ctx.account(),
+					"#ids": { "resultOf": "c", "name": "Email/changes", "path": path },
+					"properties": SUMMARY_PROPERTIES,
+				}),
+				call.to_string(),
+			)
+		};
+		let responses = ctx
+			.call(vec![
+				("Email/changes".into(), json!({ "accountId": ctx.account(), "sinceState": state, "maxChanges": CHANGES_PAGE }), "c".into()),
+				get("/created", "gc"),
+				get("/updated", "gu"),
+			])
+			.await?;
+		if let Some(error) = responses.iter().find(|r| r.call_id == "c" && r.name == "error") {
+			return match error.args["type"].as_str() {
+				Some("cannotCalculateChanges") | Some("unknownMethod") => Ok(None),
+				other => Err(CoreError::server(format!("Email/changes: {}", other.unwrap_or("serverFail")))),
+			};
+		}
+		let changes = jmap::response(&responses, "c", "Email/changes")?;
+		let mut rows: Vec<StoredMessage> = Vec::new();
+		for call in ["gc", "gu"] {
+			let list = jmap::response(&responses, call, "Email/get")?;
+			rows.extend(list["list"].as_array().into_iter().flatten().filter_map(|email| parse_summary(email, None)));
+		}
+		ctx.store.upsert_messages(account_id, &rows)?;
+		let destroyed: Vec<String> =
+			changes["destroyed"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+		ctx.store.remove_messages(account_id, &destroyed)?;
+		state = changes["newState"].as_str().ok_or_else(|| CoreError::server("Email/changes has no newState"))?.to_string();
+		if !changes["hasMoreChanges"].as_bool().unwrap_or(false) {
+			return Ok(Some(state));
+		}
+	}
+	// A very long backlog: resume from here on the next sync.
+	Ok(Some(state))
+}
+
 /// Full-text search on the server (`text` filter), for mail outside the
 /// synced windows. Results are cached like any other rows.
 pub async fn search_server(ctx: &Context<'_>, account_id: &str, query: &str, limit: u32) -> Result<Vec<MessageSummary>> {

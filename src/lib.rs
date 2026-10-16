@@ -4,6 +4,7 @@
 
 mod actions;
 mod compose;
+mod device;
 mod error;
 mod jmap;
 mod sanitize;
@@ -94,7 +95,22 @@ impl Inner {
 			}
 			let mailboxes = sync::sync_mailboxes(&ctx, account_id).await?;
 			self.emit(CoreEvent::MailboxesChanged { account_id: account_id.to_string() });
-			sync::sync_messages(&ctx, account_id, &mailboxes).await?;
+			// Deltas when the server keeps a change log; otherwise (or when the
+			// state expired) re-query the windows. The state is read before the
+			// windows so changes made meanwhile are replayed next time.
+			let delta = match self.store.email_state(account_id)? {
+				Some(since) => sync::delta_sync(&ctx, account_id, &since).await?,
+				None => None,
+			};
+			let state = match delta {
+				Some(state) => Some(state),
+				None => {
+					let state = sync::email_state(&ctx).await?;
+					sync::sync_messages(&ctx, account_id, &mailboxes).await?;
+					state
+				}
+			};
+			self.store.set_email_state(account_id, state.as_deref())?;
 			self.emit(CoreEvent::MessagesChanged { account_id: account_id.to_string() });
 			Ok(())
 		}
@@ -104,6 +120,59 @@ impl Inner {
 			error: result.as_ref().err().map(|e: &CoreError| e.to_string()),
 		});
 		result
+	}
+
+	/// Verifies `secret` against the first session URL that answers and stores the account.
+	async fn add_account(&self, email: &str, secret: &str, candidates: Vec<String>, auth_kind: &str) -> Result<Account> {
+		let credentials = Credentials { username: email.to_string(), secret: secret.to_string() };
+		let mut last_error = None;
+		let mut session = None;
+		for candidate in candidates {
+			match jmap::fetch_session(&self.http, &candidate, &credentials).await {
+				Ok(found) => {
+					session = Some((candidate, found));
+					break;
+				}
+				Err(error @ CoreError::Auth { .. }) => return Err(error),
+				Err(error) => last_error = Some(error),
+			}
+		}
+		let Some((candidate, session)) = session else {
+			return Err(match last_error {
+				Some(CoreError::Network { .. }) | None => {
+					CoreError::Discovery { message: "Couldn't find a mail server for this address. Enter the server address.".into() }
+				}
+				Some(error) => error,
+			});
+		};
+		let server = url::Url::parse(&candidate).map(|u| u.origin().ascii_serialization()).unwrap_or(candidate);
+		let id = self.store.find_account_id(email, &server)?.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+		// Replacing a device key: revoke the previous one.
+		if self.store.auth_kind(&id).ok().as_deref() == Some("device") {
+			if let Some(previous) = self.credentials.load(id.clone()).filter(|p| p != secret) {
+				let old = Credentials { username: email.to_string(), secret: previous };
+				if let Ok(origin) = device::api_origin(&session.api_url) {
+					let _ = device::revoke(&self.http, &origin, &old).await;
+				}
+			}
+		}
+		if !self.credentials.save(id.clone(), secret.to_string()) {
+			return Err(CoreError::Storage { message: "Couldn't save the password to the keychain".into() });
+		}
+		let display_name = if session.account_name.is_empty() { email.to_string() } else { session.account_name.clone() };
+		self.store.insert_account(store::NewAccount {
+			id: &id,
+			email,
+			display_name: &display_name,
+			server_url: &server,
+			session_url: &session.session_url,
+			api_url: &session.api_url,
+			download_url: &session.download_url,
+			upload_url: &session.upload_url,
+			jmap_account_id: &session.account_id,
+		})?;
+		self.store.set_auth_kind(&id, auth_kind)?;
+		Ok(Account { id, email: email.to_string(), display_name, server_url: server })
 	}
 
 	async fn flush(&self, account_id: &str) -> Result<actions::FlushReport> {
@@ -208,51 +277,91 @@ impl MailCore {
 			if email.is_empty() || app_password.trim().is_empty() {
 				return Err(CoreError::invalid("Enter your email and app password"));
 			}
-			let credentials = Credentials { username: email.clone(), secret: app_password.trim().to_string() };
-			let mut last_error = None;
-			let mut session = None;
-			for candidate in jmap::session_candidates(&email, server_url.as_deref())? {
-				match jmap::fetch_session(&inner.http, &candidate, &credentials).await {
-					Ok(found) => {
-						session = Some((candidate, found));
-						break;
+			let candidates = jmap::session_candidates(&email, server_url.as_deref())?;
+			inner.add_account(&email, app_password.trim(), candidates, "app_password").await
+		})
+		.await
+	}
+
+	/// Signs in to a Mailflare server with the account password. The server
+	/// returns a device key, which is stored like an app password and revoked
+	/// on sign-out. With two-factor on, returns `MfaRequired`.
+	pub async fn sign_in_with_password(
+		&self,
+		email: String,
+		password: String,
+		server_url: Option<String>,
+		device_name: String,
+	) -> Result<PasswordSignIn> {
+		self.run(move |inner| async move {
+			let email = email.trim().to_string();
+			if email.is_empty() || password.is_empty() {
+				return Err(CoreError::invalid("Enter your email and password"));
+			}
+			let body = device::password_body(&email, &password, &device_name);
+			let mut last_network = None;
+			for origin in device::origins(&email, server_url.as_deref())? {
+				match device::login(&inner.http, &origin, body.clone()).await {
+					Ok(Some(device::DeviceLogin::Key { key, session_url })) => {
+						let account = inner.add_account(&email, &key, vec![session_url], "device").await?;
+						return Ok(PasswordSignIn::SignedIn { account });
 					}
-					Err(error @ CoreError::Auth { .. }) => return Err(error),
-					Err(error) => last_error = Some(error),
+					Ok(Some(device::DeviceLogin::Mfa { challenge_token })) => {
+						return Ok(PasswordSignIn::MfaRequired { challenge_token, server_url: origin });
+					}
+					Ok(None) => continue,
+					Err(error @ CoreError::Network { .. }) => {
+						last_network = Some(error);
+						continue;
+					}
+					Err(error) => return Err(error),
 				}
 			}
-			let Some((candidate, session)) = session else {
-				return Err(match last_error {
-					Some(CoreError::Network { .. }) | None => CoreError::Discovery {
-						message: "Couldn't find a mail server for this address. Enter the server address.".into(),
-					},
-					Some(error) => error,
-				});
-			};
-			let server = url::Url::parse(&candidate).map(|u| u.origin().ascii_serialization()).unwrap_or(candidate);
-			let id = inner.store.find_account_id(&email, &server)?.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-			if !inner.credentials.save(id.clone(), credentials.secret.clone()) {
-				return Err(CoreError::Storage { message: "Couldn't save the password to the keychain".into() });
+			if let Some(error) = last_network {
+				return Err(error);
 			}
-			let display_name = if session.account_name.is_empty() { email.clone() } else { session.account_name.clone() };
-			inner.store.insert_account(store::NewAccount {
-				id: &id,
-				email: &email,
-				display_name: &display_name,
-				server_url: &server,
-				session_url: &session.session_url,
-				api_url: &session.api_url,
-				download_url: &session.download_url,
-				upload_url: &session.upload_url,
-				jmap_account_id: &session.account_id,
-			})?;
-			Ok(Account { id, email, display_name, server_url: server })
+			Err(CoreError::Discovery {
+				message: "This server doesn't offer password sign-in. Use an app password, or enter the server address.".into(),
+			})
+		})
+		.await
+	}
+
+	/// Finishes a password sign-in with a TOTP or recovery code.
+	pub async fn complete_mfa(
+		&self,
+		email: String,
+		challenge_token: String,
+		code: String,
+		server_url: String,
+		device_name: String,
+	) -> Result<Account> {
+		self.run(move |inner| async move {
+			let body = device::mfa_body(&challenge_token, code.trim(), &device_name);
+			match device::login(&inner.http, &server_url, body).await? {
+				Some(device::DeviceLogin::Key { key, session_url }) => inner.add_account(email.trim(), &key, vec![session_url], "device").await,
+				Some(device::DeviceLogin::Mfa { .. }) => Err(CoreError::Auth { message: "The code was not accepted.".into() }),
+				None => Err(CoreError::Discovery { message: "The server stopped answering this sign-in. Start again.".into() }),
+			}
 		})
 		.await
 	}
 
 	/// Removes the account, its cached mail, queued actions and its secret.
+	/// A device key from a password sign-in is also revoked on the server
+	/// (best effort; the local data goes regardless).
 	pub fn sign_out(&self, account_id: String) -> Result<()> {
+		if self.inner.store.auth_kind(&account_id)? == "device" {
+			if let (Ok(endpoint), Some(secret)) = (self.inner.store.endpoint(&account_id), self.inner.credentials.load(account_id.clone())) {
+				let http = self.inner.http.clone();
+				let credentials = Credentials { username: endpoint.email.clone(), secret };
+				if let Ok(origin) = device::api_origin(&endpoint.api_url) {
+					self.runtime.spawn(async move {
+						let _ = device::revoke(&http, &origin, &credentials).await;
+					});
+				}
+			}
+		}
 		for action in self.inner.store.pending_actions(&account_id)? {
 			let _ = std::fs::remove_dir_all(actions::outbox_dir(&self.inner.data_dir, &action.client_id));
 		}
@@ -260,6 +369,33 @@ impl MailCore {
 		self.inner.store.delete_account(&account_id)?;
 		self.inner.credentials.delete(account_id);
 		Ok(())
+	}
+
+	/// Registers this device's APNs token for new-mail pushes.
+	pub async fn register_push(&self, account_id: String, registration: PushRegistration) -> Result<()> {
+		self.run(move |inner| async move {
+			let ctx = inner.context(&account_id)?;
+			let origin = device::api_origin(&ctx.endpoint.api_url)?;
+			let body = serde_json::json!({
+				"platform": "apns",
+				"token": registration.token,
+				"environment": match registration.environment { PushEnvironment::Production => "production", PushEnvironment::Sandbox => "sandbox" },
+				"topic": registration.topic,
+				"publicKey": registration.public_key,
+				"previews": registration.previews,
+			});
+			device::register_push(&inner.http, &origin, &ctx.credentials, body).await
+		})
+		.await
+	}
+
+	pub async fn unregister_push(&self, account_id: String) -> Result<()> {
+		self.run(move |inner| async move {
+			let ctx = inner.context(&account_id)?;
+			let origin = device::api_origin(&ctx.endpoint.api_url)?;
+			device::unregister_push(&inner.http, &origin, &ctx.credentials).await
+		})
+		.await
 	}
 
 	pub fn mailboxes(&self, account_id: String) -> Result<Vec<Mailbox>> {

@@ -10,7 +10,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use crate::error::Result;
 use crate::types::{Account, Attachment, EmailAddress, Folder, Identity, Mailbox, MessageDetail, MessageSummary};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -122,6 +122,13 @@ CREATE TABLE identities (
 
 const SCHEMA_V3: &str = r#"
 ALTER TABLE messages ADD COLUMN to_display TEXT NOT NULL DEFAULT '';
+"#;
+
+const SCHEMA_V4: &str = r#"
+-- The JMAP Email state the store reflects; `Email/changes` continues from it.
+ALTER TABLE accounts ADD COLUMN email_state TEXT;
+-- 'app_password' or 'device' (a key from a password sign-in, revoked on sign-out).
+ALTER TABLE accounts ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'app_password';
 "#;
 
 const SUMMARY_COLUMNS: &str =
@@ -770,6 +777,56 @@ impl Store {
 
 /// Milestone 2: identities, moves, deletes and the send/draft outbox.
 impl Store {
+	pub fn email_state(&self, account_id: &str) -> Result<Option<String>> {
+		self.read(|conn| {
+			Ok(conn
+				.query_row("SELECT email_state FROM accounts WHERE id = ?1", params![account_id], |row| row.get(0))
+				.optional()?
+				.flatten())
+		})
+	}
+
+	pub fn set_email_state(&self, account_id: &str, state: Option<&str>) -> Result<()> {
+		self.write(|conn| {
+			conn.execute("UPDATE accounts SET email_state = ?2 WHERE id = ?1", params![account_id, state])?;
+			Ok(())
+		})
+	}
+
+	pub fn auth_kind(&self, account_id: &str) -> Result<String> {
+		self.read(|conn| {
+			Ok(conn
+				.query_row("SELECT auth_kind FROM accounts WHERE id = ?1", params![account_id], |row| row.get(0))
+				.optional()?
+				.unwrap_or_else(|| "app_password".into()))
+		})
+	}
+
+	pub fn set_auth_kind(&self, account_id: &str, kind: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute("UPDATE accounts SET auth_kind = ?2 WHERE id = ?1", params![account_id, kind])?;
+			Ok(())
+		})
+	}
+
+	/// Removes messages the server destroyed.
+	pub fn remove_messages(&self, account_id: &str, ids: &[String]) -> Result<usize> {
+		self.write(|conn| {
+			let tx = conn.transaction()?;
+			let mut removed = 0;
+			{
+				let mut bodies = tx.prepare_cached("DELETE FROM bodies WHERE account_id = ?1 AND id = ?2")?;
+				let mut messages = tx.prepare_cached("DELETE FROM messages WHERE account_id = ?1 AND id = ?2")?;
+				for id in ids {
+					bodies.execute(params![account_id, id])?;
+					removed += messages.execute(params![account_id, id])?;
+				}
+			}
+			tx.commit()?;
+			Ok(removed)
+		})
+	}
+
 	/// Refreshes the URLs from a re-fetched session (accounts added before
 	/// uploads existed have none).
 	pub fn update_session_urls(&self, account_id: &str, api_url: &str, download_url: &str, upload_url: &str) -> Result<()> {
@@ -973,7 +1030,10 @@ fn migrate(conn: &Connection) -> Result<()> {
 		conn.execute_batch(&format!("BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"))?;
 	}
 	if version < 3 {
-		conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"))?;
+	}
+	if version < 4 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V4} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
 	}
 	Ok(())
 }

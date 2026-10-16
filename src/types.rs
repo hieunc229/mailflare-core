@@ -176,3 +176,28 @@ pub struct OutboxItem {
 	/// True once automatic retries stopped; the user can retry or discard it.
 	pub stalled: bool,
 }
+
+/// The result of a password sign-in: done, or a second factor is needed.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum PasswordSignIn {
+	SignedIn { account: Account },
+	/// Ask for a TOTP or recovery code, then call `complete_mfa` with these values.
+	MfaRequired { challenge_token: String, server_url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum PushEnvironment {
+	Production,
+	Sandbox,
+}
+
+/// An APNs registration. `public_key` is the device's P-256 key (raw
+/// uncompressed point, base64) that previews are encrypted to.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PushRegistration {
+	pub token: String,
+	pub environment: PushEnvironment,
+	pub topic: String,
+	pub public_key: Option<String>,
+	pub previews: bool,
+}

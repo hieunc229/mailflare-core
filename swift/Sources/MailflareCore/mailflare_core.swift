@@ -954,6 +954,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func cachedMessage(accountId: String, messageId: String) throws  -> MessageDetail?
     
     /**
+     * Finishes a password sign-in with a TOTP or recovery code.
+     */
+    func completeMfa(email: String, challengeToken: String, code: String, serverUrl: String, deviceName: String) async throws  -> Account
+    
+    /**
      * A prefilled composer for replying to or forwarding `message_id`.
      */
     func composeTemplate(accountId: String, messageId: String, kind: ReplyKind) async throws  -> ComposeTemplate
@@ -1027,6 +1032,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func pendingActionCount(accountId: String) throws  -> UInt32
     
     /**
+     * Registers this device's APNs token for new-mail pushes.
+     */
+    func registerPush(accountId: String, registration: PushRegistration) async throws 
+    
+    /**
      * Retries a stalled outbox item now.
      */
     func retryOutboxItem(accountId: String, clientId: String) throws 
@@ -1067,7 +1077,16 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func signIn(email: String, appPassword: String, serverUrl: String?) async throws  -> Account
     
     /**
+     * Signs in to a Mailflare server with the account password. The server
+     * returns a device key, which is stored like an app password and revoked
+     * on sign-out. With two-factor on, returns `MfaRequired`.
+     */
+    func signInWithPassword(email: String, password: String, serverUrl: String?, deviceName: String) async throws  -> PasswordSignIn
+    
+    /**
      * Removes the account, its cached mail, queued actions and its secret.
+     * A device key from a password sign-in is also revoked on the server
+     * (best effort; the local data goes regardless).
      */
     func signOut(accountId: String) throws 
     
@@ -1082,6 +1101,8 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      * Unread count as the server reports it, adjusted for local actions.
      */
     func unreadCount(accountId: String, folder: Folder) throws  -> UInt32
+    
+    func unregisterPush(accountId: String) async throws 
     
 }
 open class MailCore: MailCoreProtocol, @unchecked Sendable {
@@ -1165,6 +1186,26 @@ open func cachedMessage(accountId: String, messageId: String)throws  -> MessageD
         FfiConverterString.lower(messageId),$0
     )
 })
+}
+    
+    /**
+     * Finishes a password sign-in with a TOTP or recovery code.
+     */
+open func completeMfa(email: String, challengeToken: String, code: String, serverUrl: String, deviceName: String)async throws  -> Account  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_complete_mfa(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(email),FfiConverterString.lower(challengeToken),FfiConverterString.lower(code),FfiConverterString.lower(serverUrl),FfiConverterString.lower(deviceName)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAccount_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -1389,6 +1430,26 @@ open func pendingActionCount(accountId: String)throws  -> UInt32  {
 }
     
     /**
+     * Registers this device's APNs token for new-mail pushes.
+     */
+open func registerPush(accountId: String, registration: PushRegistration)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_register_push(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterTypePushRegistration_lower(registration)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_void,
+            completeFunc: ffi_mailflare_core_rust_future_complete_void,
+            freeFunc: ffi_mailflare_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Retries a stalled outbox item now.
      */
 open func retryOutboxItem(accountId: String, clientId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -1506,7 +1567,31 @@ open func signIn(email: String, appPassword: String, serverUrl: String?)async th
 }
     
     /**
+     * Signs in to a Mailflare server with the account password. The server
+     * returns a device key, which is stored like an app password and revoked
+     * on sign-out. With two-factor on, returns `MfaRequired`.
+     */
+open func signInWithPassword(email: String, password: String, serverUrl: String?, deviceName: String)async throws  -> PasswordSignIn  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_sign_in_with_password(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(email),FfiConverterString.lower(password),FfiConverterOptionString.lower(serverUrl),FfiConverterString.lower(deviceName)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePasswordSignIn_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Removes the account, its cached mail, queued actions and its secret.
+     * A device key from a password sign-in is also revoked on the server
+     * (best effort; the local data goes regardless).
      */
 open func signOut(accountId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_mailflare_core_fn_method_mailcore_sign_out(self.uniffiClonePointer(),
@@ -1555,6 +1640,23 @@ open func unreadCount(accountId: String, folder: Folder)throws  -> UInt32  {
         FfiConverterTypeFolder_lower(folder),$0
     )
 })
+}
+    
+open func unregisterPush(accountId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_unregister_push(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_void,
+            completeFunc: ffi_mailflare_core_rust_future_complete_void,
+            freeFunc: ffi_mailflare_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 
@@ -2884,6 +2986,104 @@ public func FfiConverterTypeOutgoingMessage_lower(_ value: OutgoingMessage) -> R
 
 
 /**
+ * An APNs registration. `public_key` is the device's P-256 key (raw
+ * uncompressed point, base64) that previews are encrypted to.
+ */
+public struct PushRegistration {
+    public var token: String
+    public var environment: PushEnvironment
+    public var topic: String
+    public var publicKey: String?
+    public var previews: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(token: String, environment: PushEnvironment, topic: String, publicKey: String?, previews: Bool) {
+        self.token = token
+        self.environment = environment
+        self.topic = topic
+        self.publicKey = publicKey
+        self.previews = previews
+    }
+}
+
+#if compiler(>=6)
+extension PushRegistration: Sendable {}
+#endif
+
+
+extension PushRegistration: Equatable, Hashable {
+    public static func ==(lhs: PushRegistration, rhs: PushRegistration) -> Bool {
+        if lhs.token != rhs.token {
+            return false
+        }
+        if lhs.environment != rhs.environment {
+            return false
+        }
+        if lhs.topic != rhs.topic {
+            return false
+        }
+        if lhs.publicKey != rhs.publicKey {
+            return false
+        }
+        if lhs.previews != rhs.previews {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(token)
+        hasher.combine(environment)
+        hasher.combine(topic)
+        hasher.combine(publicKey)
+        hasher.combine(previews)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushRegistration: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushRegistration {
+        return
+            try PushRegistration(
+                token: FfiConverterString.read(from: &buf), 
+                environment: FfiConverterTypePushEnvironment.read(from: &buf), 
+                topic: FfiConverterString.read(from: &buf), 
+                publicKey: FfiConverterOptionString.read(from: &buf), 
+                previews: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PushRegistration, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.token, into: &buf)
+        FfiConverterTypePushEnvironment.write(value.environment, into: &buf)
+        FfiConverterString.write(value.topic, into: &buf)
+        FfiConverterOptionString.write(value.publicKey, into: &buf)
+        FfiConverterBool.write(value.previews, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRegistration_lift(_ buf: RustBuffer) throws -> PushRegistration {
+    return try FfiConverterTypePushRegistration.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushRegistration_lower(_ value: PushRegistration) -> RustBuffer {
+    return FfiConverterTypePushRegistration.lower(value)
+}
+
+
+/**
  * Errors crossing the FFI boundary. Each variant carries a message the UI can
  * show; the variant tells the UI how to react (re-auth, retry, give up).
  */
@@ -3396,6 +3596,159 @@ extension OutboxKind: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The result of a password sign-in: done, or a second factor is needed.
+ */
+
+public enum PasswordSignIn {
+    
+    case signedIn(account: Account
+    )
+    /**
+     * Ask for a TOTP or recovery code, then call `complete_mfa` with these values.
+     */
+    case mfaRequired(challengeToken: String, serverUrl: String
+    )
+}
+
+
+#if compiler(>=6)
+extension PasswordSignIn: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePasswordSignIn: FfiConverterRustBuffer {
+    typealias SwiftType = PasswordSignIn
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PasswordSignIn {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .signedIn(account: try FfiConverterTypeAccount.read(from: &buf)
+        )
+        
+        case 2: return .mfaRequired(challengeToken: try FfiConverterString.read(from: &buf), serverUrl: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PasswordSignIn, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .signedIn(account):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeAccount.write(account, into: &buf)
+            
+        
+        case let .mfaRequired(challengeToken,serverUrl):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(challengeToken, into: &buf)
+            FfiConverterString.write(serverUrl, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePasswordSignIn_lift(_ buf: RustBuffer) throws -> PasswordSignIn {
+    return try FfiConverterTypePasswordSignIn.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePasswordSignIn_lower(_ value: PasswordSignIn) -> RustBuffer {
+    return FfiConverterTypePasswordSignIn.lower(value)
+}
+
+
+extension PasswordSignIn: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum PushEnvironment {
+    
+    case production
+    case sandbox
+}
+
+
+#if compiler(>=6)
+extension PushEnvironment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePushEnvironment: FfiConverterRustBuffer {
+    typealias SwiftType = PushEnvironment
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PushEnvironment {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .production
+        
+        case 2: return .sandbox
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PushEnvironment, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .production:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sandbox:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushEnvironment_lift(_ buf: RustBuffer) throws -> PushEnvironment {
+    return try FfiConverterTypePushEnvironment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePushEnvironment_lower(_ value: PushEnvironment) -> RustBuffer {
+    return FfiConverterTypePushEnvironment.lower(value)
+}
+
+
+extension PushEnvironment: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ReplyKind {
     
@@ -3884,6 +4237,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_cached_message() != 29470) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_complete_mfa() != 5341) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_compose_template() != 12291) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3932,6 +4288,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_pending_action_count() != 40755) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_register_push() != 35138) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_retry_outbox_item() != 57888) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3959,7 +4318,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_sign_in() != 45279) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mailflare_core_checksum_method_mailcore_sign_out() != 2207) {
+    if (uniffi_mailflare_core_checksum_method_mailcore_sign_in_with_password() != 3576) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_sign_out() != 34644) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_suggest_contacts() != 46853) {
@@ -3969,6 +4331,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_unread_count() != 24168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_unregister_push() != 15814) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_constructor_mailcore_new() != 63876) {

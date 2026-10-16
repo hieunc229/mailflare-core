@@ -14,6 +14,7 @@ exposed to Swift and Kotlin through UniFFI.
 | `src/sync.rs` | Mailbox, identity and message window sync, `fetch_older` paging, body loading, server search, blob transfer |
 | `src/actions.rs` | Replays the persistent queue: keywords, moves, deletes, draft saves and sends |
 | `src/compose.rs` | Reply, reply-all, forward and draft templates; text/plain alternative |
+| `src/device.rs` | Mailflare's mobile endpoints: password sign-in for a device key, self-revoke, APNs registration |
 | `src/sanitize.rs` | ammonia-based sanitizer; remote URLs are kept and blocked by the renderer |
 | `swift/Sources/MailflareCore` | Generated Swift bindings (committed) |
 | `Package.swift` | Swift package the iOS app depends on (`../mailflare-core`) |
@@ -34,7 +35,12 @@ End-to-end checks against a running server (for example `npm run dev` in `../mai
 ```bash
 MAILFLARE_EMAIL=you@example.com MAILFLARE_KEY=ep_… MAILFLARE_SERVER=http://localhost:3000 cargo run --example smoke
 MAILFLARE_EMAIL=you@example.com MAILFLARE_KEY=ep_… MAILFLARE_SERVER=http://localhost:3000 cargo run --example actions
+MAILFLARE_EMAIL=you@example.com MAILFLARE_PASSWORD=… MAILFLARE_SERVER=http://localhost:3000 cargo run --example device
 ```
+
+`device` (needs `MAILFLARE_PASSWORD` instead of a key) signs in with the
+account password, checks that a change made by another client arrives through
+`Email/changes`, registers a push token and verifies sign-out revoked the key.
 
 `actions` saves a draft with an attachment, downloads it back, sends it to the
 account's own address, archives and restores an inbox message, and trashes then
@@ -42,7 +48,8 @@ deletes the sent copy.
 
 ## Behaviour notes
 
-- Mailflare answers `*/changes` with `cannotCalculateChanges`, so `sync` re-queries the newest 200 messages per leaf mailbox and diffs ids inside that window. `fetch_older` pages in 100 more from the server.
+- `sync` continues from the stored Email state with `Email/changes` (200 per round, created and updated fetched by back-reference, destroyed removed). When the server cannot continue (no change log, expired state, access changed) it falls back to the window: the newest 200 messages per leaf mailbox, diffed by id. The state is read before the window queries, so changes made meanwhile are replayed next time. `fetch_older` pages in 100 more.
+- `sign_in_with_password` posts to the server's `/api/auth/device` and stores the returned device key like an app password (`auth_kind = 'device'`); `sign_out` revokes it. `MfaRequired` carries the challenge for `complete_mfa`.
 - Mailflare's top-level mailbox per address aggregates its children; only role and folder mailboxes are synced so mail is not filed twice. `Folder::Role` lists span every address of the account.
 - Every write (`set_seen`, `set_flagged`, `move_messages`, `delete_messages`, `save_draft`, `send`) applies locally and enqueues an action in one transaction; the queue is replayed before every sync and survives restarts. A sync never overwrites a row with a queued change, and never resurrects a row deleted locally.
 - Sends and draft saves run in recorded steps (uploads, the draft, the submission) so a replay resumes after the last finished step. Mailflare deletes a draft once it is submitted, so a submission retried after a lost response is recognised as already sent. Actions that keep failing stop after 5 attempts and wait in `outbox()` for `retry_outbox_item` or `discard_outbox_item`.
