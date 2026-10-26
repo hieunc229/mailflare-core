@@ -406,6 +406,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -949,6 +965,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func accounts() throws  -> [Account]
     
     /**
+     * The AI summary saved for a message, if one was made.
+     */
+    func aiSummary(accountId: String, messageId: String) throws  -> String?
+    
+    /**
      * The message with its body if the body is cached, without touching the network.
      */
     func cachedMessage(accountId: String, messageId: String) throws  -> MessageDetail?
@@ -962,6 +983,16 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      * A prefilled composer for replying to or forwarding `message_id`.
      */
     func composeTemplate(accountId: String, messageId: String, kind: ReplyKind) async throws  -> ComposeTemplate
+    
+    /**
+     * Creates a folder under `parent_id` (an account's top-level mailbox when None), then re-reads the list.
+     */
+    func createFolder(accountId: String, parentId: String?, name: String) async throws 
+    
+    /**
+     * Deletes a folder. See `FolderSupport::delete_note` for what happens to its mail.
+     */
+    func deleteFolder(accountId: String, mailboxId: String) async throws 
     
     /**
      * Moves messages to Trash; messages already in Trash or Drafts are
@@ -996,6 +1027,11 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
      * Retries queued actions, e.g. when connectivity returns.
      */
     func flushActions(accountId: String) 
+    
+    /**
+     * What this account allows for folders, and how to word it (Gmail calls them labels).
+     */
+    func folderSupport(accountId: String) throws  -> FolderSupport
     
     /**
      * Addresses the account may send from.
@@ -1033,13 +1069,25 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     
     /**
      * Registers this device's APNs token for new-mail pushes.
+     * Returns false when the server accepted the registration but cannot send
+     * pushes (no APNs configuration), so the app can say so.
      */
-    func registerPush(accountId: String, registration: PushRegistration) async throws 
+    func registerPush(accountId: String, registration: PushRegistration) async throws  -> Bool
+    
+    /**
+     * Renames a folder. IMAP ids carry the path, so mail in a renamed folder is read again from the server.
+     */
+    func renameFolder(accountId: String, mailboxId: String, name: String) async throws 
     
     /**
      * Retries a stalled outbox item now.
      */
     func retryOutboxItem(accountId: String, clientId: String) throws 
+    
+    /**
+     * Saves (replacing) the AI summary the app generated for a message.
+     */
+    func saveAiSummary(accountId: String, messageId: String, text: String) throws 
     
     /**
      * Queues saving a draft to the server's Drafts.
@@ -1077,6 +1125,20 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func signIn(email: String, appPassword: String, serverUrl: String?) async throws  -> Account
     
     /**
+     * Signs in to an IMAP account with an app password: checks the login on the
+     * incoming and the outgoing server, then stores the account. Mail arrives
+     * with the first sync.
+     */
+    func signInImap(email: String, password: String, config: MailServerConfig) async throws  -> Account
+    
+    /**
+     * Signs in to Gmail or Outlook with the redirect URL the browser sign-in
+     * ended on (see `oauth_authorization`). `config` holds the provider's IMAP
+     * and SMTP servers; the login is the email address.
+     */
+    func signInOauth(email: String, client: OAuthClient, authorization: OAuthAuthorization, redirectUrl: String, config: MailServerConfig) async throws  -> Account
+    
+    /**
      * Signs in to a Mailflare server with the account password. The server
      * returns a device key, which is stored like an app password and revoked
      * on sign-out. With two-factor on, returns `MfaRequired`.
@@ -1096,6 +1158,12 @@ public protocol MailCoreProtocol: AnyObject, Sendable {
     func suggestContacts(accountId: String, prefix: String, limit: UInt32) throws  -> [EmailAddress]
     
     func sync(accountId: String) async throws 
+    
+    /**
+     * A cheap refresh for background wake-ups: IMAP accounts sync only their
+     * inbox on one connection; other accounts use their normal delta sync.
+     */
+    func syncQuick(accountId: String) async throws 
     
     /**
      * Unread count as the server reports it, adjusted for local actions.
@@ -1177,6 +1245,18 @@ open func accounts()throws  -> [Account]  {
 }
     
     /**
+     * The AI summary saved for a message, if one was made.
+     */
+open func aiSummary(accountId: String, messageId: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_ai_summary(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(messageId),$0
+    )
+})
+}
+    
+    /**
      * The message with its body if the body is cached, without touching the network.
      */
 open func cachedMessage(accountId: String, messageId: String)throws  -> MessageDetail?  {
@@ -1224,6 +1304,46 @@ open func composeTemplate(accountId: String, messageId: String, kind: ReplyKind)
             completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
             freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeComposeTemplate_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Creates a folder under `parent_id` (an account's top-level mailbox when None), then re-reads the list.
+     */
+open func createFolder(accountId: String, parentId: String?, name: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_create_folder(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterOptionString.lower(parentId),FfiConverterString.lower(name)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_void,
+            completeFunc: ffi_mailflare_core_rust_future_complete_void,
+            freeFunc: ffi_mailflare_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Deletes a folder. See `FolderSupport::delete_note` for what happens to its mail.
+     */
+open func deleteFolder(accountId: String, mailboxId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_delete_folder(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterString.lower(mailboxId)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_void,
+            completeFunc: ffi_mailflare_core_rust_future_complete_void,
+            freeFunc: ffi_mailflare_core_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -1323,6 +1443,17 @@ open func flushActions(accountId: String)  {try! rustCall() {
         FfiConverterString.lower(accountId),$0
     )
 }
+}
+    
+    /**
+     * What this account allows for folders, and how to word it (Gmail calls them labels).
+     */
+open func folderSupport(accountId: String)throws  -> FolderSupport  {
+    return try  FfiConverterTypeFolderSupport_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_folder_support(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),$0
+    )
+})
 }
     
     /**
@@ -1431,14 +1562,36 @@ open func pendingActionCount(accountId: String)throws  -> UInt32  {
     
     /**
      * Registers this device's APNs token for new-mail pushes.
+     * Returns false when the server accepted the registration but cannot send
+     * pushes (no APNs configuration), so the app can say so.
      */
-open func registerPush(accountId: String, registration: PushRegistration)async throws   {
+open func registerPush(accountId: String, registration: PushRegistration)async throws  -> Bool  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_mailflare_core_fn_method_mailcore_register_push(
                     self.uniffiClonePointer(),
                     FfiConverterString.lower(accountId),FfiConverterTypePushRegistration_lower(registration)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_i8,
+            completeFunc: ffi_mailflare_core_rust_future_complete_i8,
+            freeFunc: ffi_mailflare_core_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Renames a folder. IMAP ids carry the path, so mail in a renamed folder is read again from the server.
+     */
+open func renameFolder(accountId: String, mailboxId: String, name: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_rename_folder(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId),FfiConverterString.lower(mailboxId),FfiConverterString.lower(name)
                 )
             },
             pollFunc: ffi_mailflare_core_rust_future_poll_void,
@@ -1456,6 +1609,18 @@ open func retryOutboxItem(accountId: String, clientId: String)throws   {try rust
     uniffi_mailflare_core_fn_method_mailcore_retry_outbox_item(self.uniffiClonePointer(),
         FfiConverterString.lower(accountId),
         FfiConverterString.lower(clientId),$0
+    )
+}
+}
+    
+    /**
+     * Saves (replacing) the AI summary the app generated for a message.
+     */
+open func saveAiSummary(accountId: String, messageId: String, text: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_method_mailcore_save_ai_summary(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountId),
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(text),$0
     )
 }
 }
@@ -1567,6 +1732,50 @@ open func signIn(email: String, appPassword: String, serverUrl: String?)async th
 }
     
     /**
+     * Signs in to an IMAP account with an app password: checks the login on the
+     * incoming and the outgoing server, then stores the account. Mail arrives
+     * with the first sync.
+     */
+open func signInImap(email: String, password: String, config: MailServerConfig)async throws  -> Account  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_sign_in_imap(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(email),FfiConverterString.lower(password),FfiConverterTypeMailServerConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAccount_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Signs in to Gmail or Outlook with the redirect URL the browser sign-in
+     * ended on (see `oauth_authorization`). `config` holds the provider's IMAP
+     * and SMTP servers; the login is the email address.
+     */
+open func signInOauth(email: String, client: OAuthClient, authorization: OAuthAuthorization, redirectUrl: String, config: MailServerConfig)async throws  -> Account  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_sign_in_oauth(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(email),FfiConverterTypeOAuthClient_lower(client),FfiConverterTypeOAuthAuthorization_lower(authorization),FfiConverterString.lower(redirectUrl),FfiConverterTypeMailServerConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_mailflare_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_mailflare_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAccount_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Signs in to a Mailflare server with the account password. The server
      * returns a device key, which is stored like an app password and revoked
      * on sign-out. With two-factor on, returns `MfaRequired`.
@@ -1618,6 +1827,27 @@ open func sync(accountId: String)async throws   {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_mailflare_core_fn_method_mailcore_sync(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountId)
+                )
+            },
+            pollFunc: ffi_mailflare_core_rust_future_poll_void,
+            completeFunc: ffi_mailflare_core_rust_future_complete_void,
+            freeFunc: ffi_mailflare_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * A cheap refresh for background wake-ups: IMAP accounts sync only their
+     * inbox on one connection; other accounts use their normal delta sync.
+     */
+open func syncQuick(accountId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_mailflare_core_fn_method_mailcore_sync_quick(
                     self.uniffiClonePointer(),
                     FfiConverterString.lower(accountId)
                 )
@@ -2115,6 +2345,115 @@ public func FfiConverterTypeEmailAddress_lower(_ value: EmailAddress) -> RustBuf
 
 
 /**
+ * What an account lets a person do with folders, and how to word it.
+ */
+public struct FolderSupport {
+    public var canCreate: Bool
+    public var canRename: Bool
+    public var canDelete: Bool
+    /**
+     * "folder", or "label" on Gmail.
+     */
+    public var noun: String
+    /**
+     * What deleting does to the mail inside, for the confirmation.
+     */
+    public var deleteNote: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(canCreate: Bool, canRename: Bool, canDelete: Bool, 
+        /**
+         * "folder", or "label" on Gmail.
+         */noun: String, 
+        /**
+         * What deleting does to the mail inside, for the confirmation.
+         */deleteNote: String) {
+        self.canCreate = canCreate
+        self.canRename = canRename
+        self.canDelete = canDelete
+        self.noun = noun
+        self.deleteNote = deleteNote
+    }
+}
+
+#if compiler(>=6)
+extension FolderSupport: Sendable {}
+#endif
+
+
+extension FolderSupport: Equatable, Hashable {
+    public static func ==(lhs: FolderSupport, rhs: FolderSupport) -> Bool {
+        if lhs.canCreate != rhs.canCreate {
+            return false
+        }
+        if lhs.canRename != rhs.canRename {
+            return false
+        }
+        if lhs.canDelete != rhs.canDelete {
+            return false
+        }
+        if lhs.noun != rhs.noun {
+            return false
+        }
+        if lhs.deleteNote != rhs.deleteNote {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(canCreate)
+        hasher.combine(canRename)
+        hasher.combine(canDelete)
+        hasher.combine(noun)
+        hasher.combine(deleteNote)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFolderSupport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FolderSupport {
+        return
+            try FolderSupport(
+                canCreate: FfiConverterBool.read(from: &buf), 
+                canRename: FfiConverterBool.read(from: &buf), 
+                canDelete: FfiConverterBool.read(from: &buf), 
+                noun: FfiConverterString.read(from: &buf), 
+                deleteNote: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FolderSupport, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.canCreate, into: &buf)
+        FfiConverterBool.write(value.canRename, into: &buf)
+        FfiConverterBool.write(value.canDelete, into: &buf)
+        FfiConverterString.write(value.noun, into: &buf)
+        FfiConverterString.write(value.deleteNote, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderSupport_lift(_ buf: RustBuffer) throws -> FolderSupport {
+    return try FfiConverterTypeFolderSupport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderSupport_lower(_ value: FolderSupport) -> RustBuffer {
+    return FfiConverterTypeFolderSupport.lower(value)
+}
+
+
+/**
  * An address the account may send from.
  */
 public struct Identity {
@@ -2192,6 +2531,165 @@ public func FfiConverterTypeIdentity_lift(_ buf: RustBuffer) throws -> Identity 
 #endif
 public func FfiConverterTypeIdentity_lower(_ value: Identity) -> RustBuffer {
     return FfiConverterTypeIdentity.lower(value)
+}
+
+
+public struct MailEndpoint {
+    public var host: String
+    public var port: UInt16
+    public var security: TransportSecurity
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(host: String, port: UInt16, security: TransportSecurity) {
+        self.host = host
+        self.port = port
+        self.security = security
+    }
+}
+
+#if compiler(>=6)
+extension MailEndpoint: Sendable {}
+#endif
+
+
+extension MailEndpoint: Equatable, Hashable {
+    public static func ==(lhs: MailEndpoint, rhs: MailEndpoint) -> Bool {
+        if lhs.host != rhs.host {
+            return false
+        }
+        if lhs.port != rhs.port {
+            return false
+        }
+        if lhs.security != rhs.security {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(host)
+        hasher.combine(port)
+        hasher.combine(security)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMailEndpoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MailEndpoint {
+        return
+            try MailEndpoint(
+                host: FfiConverterString.read(from: &buf), 
+                port: FfiConverterUInt16.read(from: &buf), 
+                security: FfiConverterTypeTransportSecurity.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MailEndpoint, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.host, into: &buf)
+        FfiConverterUInt16.write(value.port, into: &buf)
+        FfiConverterTypeTransportSecurity.write(value.security, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailEndpoint_lift(_ buf: RustBuffer) throws -> MailEndpoint {
+    return try FfiConverterTypeMailEndpoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailEndpoint_lower(_ value: MailEndpoint) -> RustBuffer {
+    return FfiConverterTypeMailEndpoint.lower(value)
+}
+
+
+/**
+ * Where an IMAP account reads and sends mail, and the login name for both.
+ */
+public struct MailServerConfig {
+    public var incoming: MailEndpoint
+    public var outgoing: MailEndpoint
+    public var username: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(incoming: MailEndpoint, outgoing: MailEndpoint, username: String) {
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.username = username
+    }
+}
+
+#if compiler(>=6)
+extension MailServerConfig: Sendable {}
+#endif
+
+
+extension MailServerConfig: Equatable, Hashable {
+    public static func ==(lhs: MailServerConfig, rhs: MailServerConfig) -> Bool {
+        if lhs.incoming != rhs.incoming {
+            return false
+        }
+        if lhs.outgoing != rhs.outgoing {
+            return false
+        }
+        if lhs.username != rhs.username {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(incoming)
+        hasher.combine(outgoing)
+        hasher.combine(username)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMailServerConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MailServerConfig {
+        return
+            try MailServerConfig(
+                incoming: FfiConverterTypeMailEndpoint.read(from: &buf), 
+                outgoing: FfiConverterTypeMailEndpoint.read(from: &buf), 
+                username: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MailServerConfig, into buf: inout [UInt8]) {
+        FfiConverterTypeMailEndpoint.write(value.incoming, into: &buf)
+        FfiConverterTypeMailEndpoint.write(value.outgoing, into: &buf)
+        FfiConverterString.write(value.username, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailServerConfig_lift(_ buf: RustBuffer) throws -> MailServerConfig {
+    return try FfiConverterTypeMailServerConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMailServerConfig_lower(_ value: MailServerConfig) -> RustBuffer {
+    return FfiConverterTypeMailServerConfig.lower(value)
 }
 
 
@@ -2618,6 +3116,174 @@ public func FfiConverterTypeMessageSummary_lift(_ buf: RustBuffer) throws -> Mes
 #endif
 public func FfiConverterTypeMessageSummary_lower(_ value: MessageSummary) -> RustBuffer {
     return FfiConverterTypeMessageSummary.lower(value)
+}
+
+
+/**
+ * What to open in the browser, and what to keep until it comes back.
+ */
+public struct OAuthAuthorization {
+    public var url: String
+    public var state: String
+    public var verifier: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, state: String, verifier: String) {
+        self.url = url
+        self.state = state
+        self.verifier = verifier
+    }
+}
+
+#if compiler(>=6)
+extension OAuthAuthorization: Sendable {}
+#endif
+
+
+extension OAuthAuthorization: Equatable, Hashable {
+    public static func ==(lhs: OAuthAuthorization, rhs: OAuthAuthorization) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.verifier != rhs.verifier {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(state)
+        hasher.combine(verifier)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOAuthAuthorization: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OAuthAuthorization {
+        return
+            try OAuthAuthorization(
+                url: FfiConverterString.read(from: &buf), 
+                state: FfiConverterString.read(from: &buf), 
+                verifier: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OAuthAuthorization, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.state, into: &buf)
+        FfiConverterString.write(value.verifier, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthAuthorization_lift(_ buf: RustBuffer) throws -> OAuthAuthorization {
+    return try FfiConverterTypeOAuthAuthorization.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthAuthorization_lower(_ value: OAuthAuthorization) -> RustBuffer {
+    return FfiConverterTypeOAuthAuthorization.lower(value)
+}
+
+
+/**
+ * The app's registration with a provider. Both values are public.
+ */
+public struct OAuthClient {
+    public var provider: OAuthProvider
+    public var clientId: String
+    /**
+     * Must match the registration, e.g. `msauth.<bundle id>://auth`.
+     */
+    public var redirectUri: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(provider: OAuthProvider, clientId: String, 
+        /**
+         * Must match the registration, e.g. `msauth.<bundle id>://auth`.
+         */redirectUri: String) {
+        self.provider = provider
+        self.clientId = clientId
+        self.redirectUri = redirectUri
+    }
+}
+
+#if compiler(>=6)
+extension OAuthClient: Sendable {}
+#endif
+
+
+extension OAuthClient: Equatable, Hashable {
+    public static func ==(lhs: OAuthClient, rhs: OAuthClient) -> Bool {
+        if lhs.provider != rhs.provider {
+            return false
+        }
+        if lhs.clientId != rhs.clientId {
+            return false
+        }
+        if lhs.redirectUri != rhs.redirectUri {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(provider)
+        hasher.combine(clientId)
+        hasher.combine(redirectUri)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOAuthClient: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OAuthClient {
+        return
+            try OAuthClient(
+                provider: FfiConverterTypeOAuthProvider.read(from: &buf), 
+                clientId: FfiConverterString.read(from: &buf), 
+                redirectUri: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OAuthClient, into buf: inout [UInt8]) {
+        FfiConverterTypeOAuthProvider.write(value.provider, into: &buf)
+        FfiConverterString.write(value.clientId, into: &buf)
+        FfiConverterString.write(value.redirectUri, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthClient_lift(_ buf: RustBuffer) throws -> OAuthClient {
+    return try FfiConverterTypeOAuthClient.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthClient_lower(_ value: OAuthClient) -> RustBuffer {
+    return FfiConverterTypeOAuthClient.lower(value)
 }
 
 
@@ -3253,6 +3919,12 @@ public enum CoreEvent {
     )
     case messagesChanged(accountId: String
     )
+    /**
+     * A message arrived since the last sync (IMAP accounts, which have no
+     * server push): the app shows a local notification.
+     */
+    case newMail(accountId: String, messageId: String, from: String, subject: String
+    )
     case syncStarted(accountId: String
     )
     case syncFinished(accountId: String, error: String?
@@ -3286,10 +3958,13 @@ public struct FfiConverterTypeCoreEvent: FfiConverterRustBuffer {
         case 4: return .messagesChanged(accountId: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .syncStarted(accountId: try FfiConverterString.read(from: &buf)
+        case 5: return .newMail(accountId: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), from: try FfiConverterString.read(from: &buf), subject: try FfiConverterString.read(from: &buf)
         )
         
-        case 6: return .syncFinished(accountId: try FfiConverterString.read(from: &buf), error: try FfiConverterOptionString.read(from: &buf)
+        case 6: return .syncStarted(accountId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .syncFinished(accountId: try FfiConverterString.read(from: &buf), error: try FfiConverterOptionString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3321,13 +3996,21 @@ public struct FfiConverterTypeCoreEvent: FfiConverterRustBuffer {
             FfiConverterString.write(accountId, into: &buf)
             
         
-        case let .syncStarted(accountId):
+        case let .newMail(accountId,messageId,from,subject):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(accountId, into: &buf)
+            FfiConverterString.write(messageId, into: &buf)
+            FfiConverterString.write(from, into: &buf)
+            FfiConverterString.write(subject, into: &buf)
+            
+        
+        case let .syncStarted(accountId):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(accountId, into: &buf)
             
         
         case let .syncFinished(accountId,error):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(accountId, into: &buf)
             FfiConverterOptionString.write(error, into: &buf)
             
@@ -3518,6 +4201,69 @@ public func FfiConverterTypeMoveTarget_lower(_ value: MoveTarget) -> RustBuffer 
 
 
 extension MoveTarget: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum OAuthProvider {
+    
+    case microsoft
+}
+
+
+#if compiler(>=6)
+extension OAuthProvider: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOAuthProvider: FfiConverterRustBuffer {
+    typealias SwiftType = OAuthProvider
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OAuthProvider {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .microsoft
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OAuthProvider, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .microsoft:
+            writeInt(&buf, Int32(1))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthProvider_lift(_ buf: RustBuffer) throws -> OAuthProvider {
+    return try FfiConverterTypeOAuthProvider.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOAuthProvider_lower(_ value: OAuthProvider) -> RustBuffer {
+    return FfiConverterTypeOAuthProvider.lower(value)
+}
+
+
+extension OAuthProvider: Equatable, Hashable {}
 
 
 
@@ -3818,6 +4564,95 @@ public func FfiConverterTypeReplyKind_lower(_ value: ReplyKind) -> RustBuffer {
 
 
 extension ReplyKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a mail server connection is secured.
+ */
+
+public enum TransportSecurity {
+    
+    /**
+     * TLS from the first byte (IMAP 993, SMTP 465).
+     */
+    case tls
+    /**
+     * Plain connection upgraded with STARTTLS (SMTP 587).
+     */
+    case startTls
+    /**
+     * No encryption; refused except for a server on this device.
+     */
+    case none
+}
+
+
+#if compiler(>=6)
+extension TransportSecurity: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTransportSecurity: FfiConverterRustBuffer {
+    typealias SwiftType = TransportSecurity
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TransportSecurity {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .tls
+        
+        case 2: return .startTls
+        
+        case 3: return .none
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TransportSecurity, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .tls:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .startTls:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .none:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTransportSecurity_lift(_ buf: RustBuffer) throws -> TransportSecurity {
+    return try FfiConverterTypeTransportSecurity.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTransportSecurity_lower(_ value: TransportSecurity) -> RustBuffer {
+    return FfiConverterTypeTransportSecurity.lower(value)
+}
+
+
+extension TransportSecurity: Equatable, Hashable {}
 
 
 
@@ -4200,6 +5035,18 @@ public func htmlToPlainText(html: String) -> String  {
     )
 })
 }
+/**
+ * The browser URL for an OAuth sign-in plus the PKCE verifier and state to
+ * pass back to `sign_in_oauth` with the redirect URL.
+ */
+public func oauthAuthorization(client: OAuthClient, email: String)throws  -> OAuthAuthorization  {
+    return try  FfiConverterTypeOAuthAuthorization_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_mailflare_core_fn_func_oauth_authorization(
+        FfiConverterTypeOAuthClient_lower(client),
+        FfiConverterString.lower(email),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4219,6 +5066,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_func_html_to_plain_text() != 15321) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_func_oauth_authorization() != 61817) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_corelistener_on_event() != 56193) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4234,6 +5084,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_accounts() != 15741) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_ai_summary() != 29593) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_cached_message() != 29470) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4241,6 +5094,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_compose_template() != 12291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_create_folder() != 26314) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_delete_folder() != 62448) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_delete_messages() != 20392) {
@@ -4259,6 +5118,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_flush_actions() != 32230) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_folder_support() != 33893) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_identities() != 24587) {
@@ -4288,10 +5150,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_pending_action_count() != 40755) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mailflare_core_checksum_method_mailcore_register_push() != 35138) {
+    if (uniffi_mailflare_core_checksum_method_mailcore_register_push() != 22974) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_rename_folder() != 18026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_retry_outbox_item() != 57888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_save_ai_summary() != 923) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_save_draft() != 54860) {
@@ -4318,6 +5186,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mailflare_core_checksum_method_mailcore_sign_in() != 45279) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mailflare_core_checksum_method_mailcore_sign_in_imap() != 5086) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_sign_in_oauth() != 61690) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mailflare_core_checksum_method_mailcore_sign_in_with_password() != 3576) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4328,6 +5202,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_sync() != 37260) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mailflare_core_checksum_method_mailcore_sync_quick() != 60493) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mailflare_core_checksum_method_mailcore_unread_count() != 24168) {

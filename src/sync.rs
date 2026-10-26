@@ -1,7 +1,8 @@
 //! Window-based sync. Mailflare answers every `*/changes` with
 //! `cannotCalculateChanges`, so each sync re-queries the newest `WINDOW`
-//! messages per mailbox and diffs ids locally. Older mail is paged in on
-//! demand with `fetch_older`.
+//! messages per mailbox and diffs ids locally. Inboxes go first and report
+//! progress after each request, so the list fills in before the rest has
+//! arrived. Older mail is paged in on demand with `fetch_older`.
 
 use serde_json::{json, Value};
 
@@ -11,8 +12,10 @@ use crate::sanitize;
 use crate::store::{AccountEndpoint, StoredBody, StoredMessage, Store};
 use crate::types::{Attachment, EmailAddress, Folder, Identity, Mailbox, MessageDetail, MessageSummary};
 
-/// Newest messages kept in sync per mailbox. Mailflare caps `maxObjectsInGet` at 200.
-pub const WINDOW: u32 = 200;
+/// Newest messages kept in sync per mailbox. Small on purpose: the first sync
+/// fetches this many from every mailbox, and `fetch_older` pages in the rest as
+/// the list scrolls. Mailflare caps `maxObjectsInGet` at 200.
+pub const WINDOW: u32 = 50;
 /// Messages per `fetch_older` page.
 pub const PAGE: u32 = 100;
 /// Two calls per mailbox; Mailflare allows 32 calls per request.
@@ -57,7 +60,7 @@ impl Context<'_> {
 		jmap::upload(self.http, &url, &self.credentials, bytes, mime_type, name).await
 	}
 
-	fn account(&self) -> &str {
+	pub(crate) fn account(&self) -> &str {
 		&self.endpoint.jmap_account_id
 	}
 }
@@ -221,9 +224,16 @@ pub fn leaf_mailboxes(mailboxes: &[Mailbox]) -> Vec<&Mailbox> {
 	mailboxes.iter().filter(|m| m.role.is_some() || m.parent_id.is_some()).collect()
 }
 
-pub async fn sync_messages(ctx: &Context<'_>, account_id: &str, mailboxes: &[Mailbox]) -> Result<()> {
-	let leaves = leaf_mailboxes(mailboxes);
-	for chunk in leaves.chunks(MAILBOXES_PER_REQUEST) {
+/// Re-queries the newest `WINDOW` messages of every mailbox, inboxes first.
+/// `on_progress` runs after each request has been stored.
+pub async fn sync_messages(ctx: &Context<'_>, account_id: &str, mailboxes: &[Mailbox], on_progress: &(dyn Fn() + Sync)) -> Result<()> {
+	let (inboxes, others): (Vec<&Mailbox>, Vec<&Mailbox>) =
+		leaf_mailboxes(mailboxes).into_iter().partition(|m| m.role.as_deref() == Some("inbox"));
+	let mut batches: Vec<Vec<&Mailbox>> = Vec::new();
+	for group in [inboxes, others] {
+		batches.extend(group.chunks(MAILBOXES_PER_REQUEST).map(<[&Mailbox]>::to_vec));
+	}
+	for chunk in batches {
 		let mut calls = Vec::new();
 		for (index, mailbox) in chunk.iter().enumerate() {
 			calls.extend(query_and_get(ctx, &index.to_string(), json!({ "inMailbox": mailbox.id }), 0, WINDOW));
@@ -236,6 +246,7 @@ pub async fn sync_messages(ctx: &Context<'_>, account_id: &str, mailboxes: &[Mai
 			let since = if complete { None } else { page.rows.iter().map(|r| r.received_at).min() };
 			ctx.store.prune_mailbox(account_id, &mailbox.id, &page.ids, since)?;
 		}
+		on_progress();
 	}
 	// Starred mail outside the windows above, so the Starred view is complete-ish.
 	let responses = ctx.call(query_and_get(ctx, "s", json!({ "hasKeyword": "$flagged" }), 0, WINDOW)).await?;

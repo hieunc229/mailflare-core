@@ -104,13 +104,13 @@ pub struct FlushReport {
 	pub outbox_changed: bool,
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
 	Done,
 	Failed(String),
 }
 
 /// Transport and auth failures stop the flush; anything else is charged to the action.
-fn is_transient(error: &CoreError) -> bool {
+pub(crate) fn is_transient(error: &CoreError) -> bool {
 	matches!(error, CoreError::Network { .. } | CoreError::Auth { .. })
 }
 

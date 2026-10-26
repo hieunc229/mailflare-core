@@ -86,6 +86,9 @@ pub enum CoreEvent {
 	/// A queued send reached the server.
 	MessageSent { account_id: String, subject: String },
 	MessagesChanged { account_id: String },
+	/// A message arrived since the last sync (IMAP accounts, which have no
+	/// server push): the app shows a local notification.
+	NewMail { account_id: String, message_id: String, from: String, subject: String },
 	SyncStarted { account_id: String },
 	SyncFinished { account_id: String, error: Option<String> },
 }
@@ -200,4 +203,30 @@ pub struct PushRegistration {
 	pub topic: String,
 	pub public_key: Option<String>,
 	pub previews: bool,
+}
+
+/// How a mail server connection is secured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Enum)]
+pub enum TransportSecurity {
+	/// TLS from the first byte (IMAP 993, SMTP 465).
+	Tls,
+	/// Plain connection upgraded with STARTTLS (SMTP 587).
+	StartTls,
+	/// No encryption; refused except for a server on this device.
+	None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct MailEndpoint {
+	pub host: String,
+	pub port: u16,
+	pub security: TransportSecurity,
+}
+
+/// Where an IMAP account reads and sends mail, and the login name for both.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct MailServerConfig {
+	pub incoming: MailEndpoint,
+	pub outgoing: MailEndpoint,
+	pub username: String,
 }

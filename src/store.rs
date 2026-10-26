@@ -10,7 +10,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use crate::error::Result;
 use crate::types::{Account, Attachment, EmailAddress, Folder, Identity, Mailbox, MessageDetail, MessageSummary};
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
@@ -120,6 +120,22 @@ CREATE TABLE identities (
 );
 "#;
 
+// Message bodies were stored with a document's <title> text left in front of the content; they are
+// fetched and cleaned again when next opened.
+const SCHEMA_V6: &str = "DELETE FROM bodies;";
+
+// AI summaries live beside the body, not in it, so re-fetching or clearing bodies keeps them.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE summaries (
+	account_id TEXT NOT NULL,
+	id TEXT NOT NULL,
+	text TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	PRIMARY KEY (account_id, id),
+	FOREIGN KEY (account_id, id) REFERENCES messages (account_id, id) ON DELETE CASCADE
+);
+"#;
+
 const SCHEMA_V3: &str = r#"
 ALTER TABLE messages ADD COLUMN to_display TEXT NOT NULL DEFAULT '';
 "#;
@@ -129,6 +145,12 @@ const SCHEMA_V4: &str = r#"
 ALTER TABLE accounts ADD COLUMN email_state TEXT;
 -- 'app_password' or 'device' (a key from a password sign-in, revoked on sign-out).
 ALTER TABLE accounts ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'app_password';
+"#;
+
+const SCHEMA_V5: &str = r#"
+-- 'jmap' (Mailflare and JMAP servers) or 'imap' (IMAP + SMTP, settings in mail_config).
+ALTER TABLE accounts ADD COLUMN protocol TEXT NOT NULL DEFAULT 'jmap';
+ALTER TABLE accounts ADD COLUMN mail_config TEXT;
 "#;
 
 const SUMMARY_COLUMNS: &str =
@@ -307,6 +329,98 @@ impl Store {
 		})
 	}
 
+	/// Stores an IMAP account. It has no JMAP session, so those columns stay empty.
+	pub fn insert_imap_account(
+		&self,
+		id: &str,
+		email: &str,
+		display_name: &str,
+		server_url: &str,
+		config: &crate::types::MailServerConfig,
+		auth_kind: &str,
+	) -> Result<()> {
+		let json = serde_json::to_string(config)?;
+		self.write(|conn| {
+			conn.execute(
+				"INSERT INTO accounts (id, email, display_name, server_url, session_url, api_url, download_url, jmap_account_id, created_at,
+				 	upload_url, protocol, mail_config, auth_kind)
+				 VALUES (?1, ?2, ?3, ?4, '', '', '', '', ?5, '', 'imap', ?6, ?7)
+				 ON CONFLICT (id) DO UPDATE SET display_name = excluded.display_name, server_url = excluded.server_url,
+				 	protocol = 'imap', mail_config = excluded.mail_config, auth_kind = excluded.auth_kind",
+				params![id, email, display_name, server_url, now(), json, auth_kind],
+			)?;
+			Ok(())
+		})
+	}
+
+	/// `jmap` or `imap`.
+	pub fn protocol(&self, account_id: &str) -> Result<String> {
+		self.read(|conn| {
+			conn.query_row("SELECT protocol FROM accounts WHERE id = ?1", params![account_id], |row| row.get(0))
+				.optional()?
+				.ok_or_else(|| crate::error::CoreError::not_found("Account not found"))
+		})
+	}
+
+	/// The email address and server settings of an IMAP account.
+	pub fn mail_config(&self, account_id: &str) -> Result<(String, crate::types::MailServerConfig)> {
+		self.read(|conn| {
+			let (email, json): (String, Option<String>) = conn
+				.query_row("SELECT email, mail_config FROM accounts WHERE id = ?1", params![account_id], |row| Ok((row.get(0)?, row.get(1)?)))
+				.optional()?
+				.ok_or_else(|| crate::error::CoreError::not_found("Account not found"))?;
+			let config = json
+				.and_then(|j| serde_json::from_str(&j).ok())
+				.ok_or_else(|| crate::error::CoreError::not_found("This account has no mail server settings"))?;
+			Ok((email, config))
+		})
+	}
+
+	/// Ids of the messages held locally for a mailbox.
+	pub fn message_ids_in_mailbox(&self, account_id: &str, mailbox_id: &str) -> Result<Vec<String>> {
+		self.read(|conn| {
+			let mut stmt = conn.prepare_cached("SELECT id FROM messages WHERE account_id = ?1 AND mailbox_id = ?2")?;
+			let rows = stmt.query_map(params![account_id, mailbox_id], |row| row.get(0))?;
+			Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+		})
+	}
+
+	/// Full rows for `ids`, so a sync can change a few fields and upsert.
+	pub fn stored_messages(&self, account_id: &str, ids: &[String]) -> Result<Vec<StoredMessage>> {
+		self.read(|conn| {
+			let mut stmt = conn.prepare_cached(
+				"SELECT id, thread_id, mailbox_id, from_name, from_email, to_display, subject, preview, received_at, seen, flagged,
+				 	has_attachment, size FROM messages WHERE account_id = ?1 AND id = ?2",
+			)?;
+			let mut out = Vec::with_capacity(ids.len());
+			for id in ids {
+				if let Some(row) = stmt
+					.query_row(params![account_id, id], |row| {
+						Ok(StoredMessage {
+							id: row.get(0)?,
+							thread_id: row.get(1)?,
+							mailbox_id: row.get(2)?,
+							from_name: row.get(3)?,
+							from_email: row.get(4)?,
+							to_display: row.get(5)?,
+							subject: row.get(6)?,
+							preview: row.get(7)?,
+							received_at: row.get(8)?,
+							seen: row.get(9)?,
+							flagged: row.get(10)?,
+							has_attachment: row.get(11)?,
+							size: row.get(12)?,
+						})
+					})
+					.optional()?
+				{
+					out.push(row);
+				}
+			}
+			Ok(out)
+		})
+	}
+
 	pub fn find_account_id(&self, email: &str, server_url: &str) -> Result<Option<String>> {
 		self.read(|conn| {
 			Ok(conn
@@ -362,6 +476,17 @@ impl Store {
 	}
 
 	// Mailboxes
+
+	/// Updates the counts of one mailbox without touching the rest.
+	pub fn set_mailbox_counts(&self, account_id: &str, mailbox_id: &str, total: u32, unread: u32) -> Result<()> {
+		self.write(|conn| {
+			conn.execute(
+				"UPDATE mailboxes SET total_emails = ?3, unread_emails = ?4 WHERE account_id = ?1 AND id = ?2",
+				params![account_id, mailbox_id, total, unread],
+			)?;
+			Ok(())
+		})
+	}
 
 	pub fn replace_mailboxes(&self, account_id: &str, mailboxes: &[Mailbox]) -> Result<()> {
 		self.write(|conn| {
@@ -725,6 +850,25 @@ impl Store {
 		})
 	}
 
+	pub fn ai_summary(&self, account_id: &str, message_id: &str) -> Result<Option<String>> {
+		self.read(|conn| {
+			Ok(conn
+				.query_row("SELECT text FROM summaries WHERE account_id = ?1 AND id = ?2", params![account_id, message_id], |row| row.get(0))
+				.optional()?)
+		})
+	}
+
+	pub fn save_ai_summary(&self, account_id: &str, message_id: &str, text: &str) -> Result<()> {
+		self.write(|conn| {
+			conn.execute(
+				"INSERT INTO summaries (account_id, id, text, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))
+				 ON CONFLICT (account_id, id) DO UPDATE SET text = excluded.text, created_at = excluded.created_at",
+				params![account_id, message_id, text],
+			)?;
+			Ok(())
+		})
+	}
+
 	pub fn save_body(&self, account_id: &str, message_id: &str, body: &StoredBody) -> Result<()> {
 		let to = serde_json::to_string(&body.to)?;
 		let cc = serde_json::to_string(&body.cc)?;
@@ -1033,7 +1177,16 @@ fn migrate(conn: &Connection) -> Result<()> {
 		conn.execute_batch(&format!("BEGIN; {SCHEMA_V3} PRAGMA user_version = 3; COMMIT;"))?;
 	}
 	if version < 4 {
-		conn.execute_batch(&format!("BEGIN; {SCHEMA_V4} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V4} PRAGMA user_version = 4; COMMIT;"))?;
+	}
+	if version < 5 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V5} PRAGMA user_version = 5; COMMIT;"))?;
+	}
+	if version < 6 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V6} PRAGMA user_version = 6; COMMIT;"))?;
+	}
+	if version < 7 {
+		conn.execute_batch(&format!("BEGIN; {SCHEMA_V7} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"))?;
 	}
 	Ok(())
 }

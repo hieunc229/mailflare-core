@@ -93,7 +93,9 @@ pub async fn revoke(http: &reqwest::Client, origin: &str, credentials: &Credenti
 	}
 }
 
-pub async fn register_push(http: &reqwest::Client, origin: &str, credentials: &Credentials, body: Value) -> Result<()> {
+/// Registers the device. Returns whether the server can actually send pushes
+/// (older servers do not say, and are assumed to).
+pub async fn register_push(http: &reqwest::Client, origin: &str, credentials: &Credentials, body: Value) -> Result<bool> {
 	let response = http
 		.put(format!("{origin}/api/mobile/push"))
 		.header(reqwest::header::AUTHORIZATION, credentials.authorization())
@@ -102,7 +104,8 @@ pub async fn register_push(http: &reqwest::Client, origin: &str, credentials: &C
 		.await?;
 	let status = response.status();
 	if status.is_success() {
-		return Ok(());
+		let value: Value = response.json().await.unwrap_or_default();
+		return Ok(value.get("deliverable").and_then(Value::as_bool).unwrap_or(true));
 	}
 	if status == reqwest::StatusCode::NOT_FOUND {
 		return Err(CoreError::server("This server does not support push notifications yet"));

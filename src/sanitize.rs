@@ -11,6 +11,9 @@ fn cleaner() -> &'static ammonia::Builder<'static> {
 		let mut builder = ammonia::Builder::default();
 		builder
 			.rm_clean_content_tags(["style"])
+			// A document's <title> is not part of the message; without this its text is left
+			// behind as a stray line above the content.
+			.add_clean_content_tags(["title"])
 			.add_tags(["style", "center", "font", "span", "div", "img", "hr", "br", "u", "s", "small", "big", "caption", "col", "colgroup"])
 			.add_generic_attributes([
 				"style", "class", "align", "valign", "width", "height", "bgcolor", "color", "border", "cellpadding",
@@ -51,6 +54,13 @@ mod tests {
 		assert!(!out.contains("script"));
 		assert!(!out.contains("onclick"));
 		assert!(out.contains("color:red"));
+	}
+
+	#[test]
+	fn drops_the_document_title() {
+		let out = sanitize_html("<html><head><title>Finish setting up your device</title></head><body><p>Hi</p></body></html>");
+		assert!(!out.contains("Finish setting up"));
+		assert!(out.contains("<p>Hi</p>"));
 	}
 
 	#[test]
